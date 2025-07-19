@@ -64,6 +64,7 @@ class FlashAttentionForwardSm100:
         m_block_size: int = 128,
         n_block_size: int = 128,
         is_persistent: bool = True,
+        score_mod: cutlass.Constexpr | None = None,
     ):
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -94,6 +95,7 @@ class FlashAttentionForwardSm100:
         self.pack_gqa = pack_gqa
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
+        self.score_mod = score_mod
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
@@ -582,6 +584,7 @@ class FlashAttentionForwardSm100:
         storage = smem.allocate(self.shared_storage)
 
         mbar_ptr = storage.mbar_ptr.data_ptr()
+        # Use the first N warps to initialize barriers
         if warp_idx == 1:
             # Init "full" barrier with number of producers, "empty" barrier with number of consumers
             for i in cutlass.range_constexpr(self.q_stage):
@@ -1243,6 +1246,9 @@ class FlashAttentionForwardSm100:
                 tStP_r2t=tStP_r2t,
                 sScale=sScale,
                 stage=stage,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                m_block=m_block,
             )
 
             cute.arch.mbarrier_wait(mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase)
@@ -1330,6 +1336,9 @@ class FlashAttentionForwardSm100:
         tStP_r2t: cute.Tensor,
         sScale: cute.Tensor,
         stage: int | Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1361,6 +1370,8 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(tScS_t2r_shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        if cutlass.const_expr(self.score_mod is not None):
+            self.score_mod(tSrS_t2r, batch_idx, head_idx, q_idx=m_block, kv_idx=n_block)
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)

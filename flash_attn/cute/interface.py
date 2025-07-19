@@ -20,7 +20,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 import torch
 
@@ -48,7 +48,6 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
-
 def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -72,7 +71,16 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
+    score_mod: Callable | None = None,
+    return_lse: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Forward pass for FlashAttention.
+    
+    Args:
+        ...
+        score_mod: A callable that takes the attention scores and applies a modification.
+        return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
+    """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -139,7 +147,7 @@ def _flash_attn_fwd(
     out = torch.empty(*q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
-    lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad else None
+    lse = torch.empty(lse_shape, dtype=torch.float32, device=device) if requires_grad or return_lse else None
 
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -172,6 +180,11 @@ def _flash_attn_fwd(
         if pack_gqa and (128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None):
             pack_gqa = False
 
+    # TODO: Hash on Callable
+    if softcap is not None:
+        assert score_mod is None, "softcap and score_mod cannot be used together"
+        score_mod = utils.create_softcap_scoremod(softcap)
+
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, softcap is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
@@ -181,6 +194,7 @@ def _flash_attn_fwd(
         m_block_size, n_block_size, num_threads, pack_gqa,
         compute_capability,
     )
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -200,6 +214,7 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
+                score_mod=score_mod,
             )
         elif compute_capability == 10:
             assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
@@ -211,6 +226,7 @@ def _flash_attn_fwd(
                 is_local=local,
                 pack_gqa=pack_gqa,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
+                score_mod=score_mod,
             )
         else:
             raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")
@@ -231,7 +247,6 @@ def _flash_attn_fwd(
 
 
 _flash_attn_fwd.compile_cache = {}
-
 
 def _flash_attn_bwd(
     q: torch.Tensor,

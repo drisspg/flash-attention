@@ -12,6 +12,11 @@ from cutlass._mlir.dialects import nvvm, llvm, arith, vector
 from cutlass.cute.runtime import from_dlpack
 
 
+def create_softcap_scoremod(softcap_val):
+    def scoremod_premask_fn(acc_S, batch_idx, head_idx, q_idx=None, kv_idx=None, softcap_val=softcap_val):
+        acc_S.store(cute.math.tanh(acc_S.load() * softcap_val, fastmath=True))
+    return scoremod_premask_fn
+
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
     return (
         from_dlpack(x, assumed_align=alignment)

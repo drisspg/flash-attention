@@ -31,7 +31,6 @@ from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, SingleTileLPTScheduler, SingleTileVarlenScheduler, ParamsBase
 
-
 class FlashAttentionForwardBase:
 
     arch: int = 80
@@ -50,6 +49,7 @@ class FlashAttentionForwardBase:
         num_stages: int = 1,
         num_threads: int = 128,
         Q_in_regs: bool = False,
+        score_mod: cutlass.Constexpr | None = None,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -65,6 +65,8 @@ class FlashAttentionForwardBase:
         :param num_threads: number of threads
         :type num_threads: int
         :param is_causal: is causal
+        :param score_mod: A callable that takes the attention scores and applies a modification.
+            Callable signature: 
         """
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -85,6 +87,7 @@ class FlashAttentionForwardBase:
         self.num_threads = num_threads
         self.num_stages = num_stages
         self.Q_in_regs = Q_in_regs
+        self.score_mod = score_mod
 
     @staticmethod
     def can_implement(
@@ -767,15 +770,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                          seqlen=seqlen.seqlen_k)
         load_V = partial(self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV,
                          seqlen=seqlen.seqlen_k)
-        # Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
-        # -inf to e.g. -50.0, which can affect the attention softmax.
-        def scoremod_premask_fn(acc_S):
-            if const_expr(softcap_val is not None):
-                acc_S.store(cute.math.tanh(acc_S.load() * softcap_val, fastmath=True))
 
         compute_one_n_block = partial(
             self.compute_one_n_block, mma_params=mma_params, smem_copy_params=smem_copy_params,
-            softmax=softmax, load_K=load_K, load_V=load_V, scoremod_premask_fn=scoremod_premask_fn,
+            softmax=softmax, load_K=load_K, load_V=load_V, scoremod_premask_fn=self.score_mod,
+            batch_idx=batch_size, head_idx=num_head, m_block=m_block,
         )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -882,7 +881,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax: Softmax,
         load_K: Callable,
         load_V: Callable,
-        scoremod_premask_fn: Callable,
+        scoremod_premask_fn: Callable | None,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        m_block: cutlass.Int32,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
@@ -916,7 +918,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # hook_fn=load_V_next,
             A_in_regs=self.Q_in_regs,
         )
-        scoremod_premask_fn(acc_S)
+        if cutlass.const_expr(scoremod_premask_fn is not None):
+            scoremod_premask_fn(acc_S, batch_idx, head_idx, q_idx=m_block, kv_idx=n_block)
+            
         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
         def load_K_next():
             if n_block - self.num_stages >= 0:
@@ -1585,17 +1589,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # if work_tile.is_valid_tile:
             # Softcapping needs to happen before masking since if we apply after masking, softcapping can turn
             # -inf to e.g. -50.0, which can affect the attention softmax.
-            def scoremod_premask_fn(acc_S):
-                if const_expr(softcap_val is not None):
-                    acc_S.store(cute.math.tanh(acc_S.load() * softcap_val, fastmath=True))
+            # def scoremod_premask_fn(acc_S):
+            #     if const_expr(softcap_val is not None):
+            #         acc_S.store(cute.math.tanh(acc_S.load() * softcap_val, fastmath=True))
 
             # shape: (atom_v_m * rest_m)
             softmax = Softmax(softmax_scale_log2, num_rows=acc_O.shape[0][0] * acc_O.shape[1])
-            mma_one_n_block = partial(
-                mma_one_n_block_all, softmax=softmax, scoremod_premask_fn=scoremod_premask_fn
-            )
-
             m_block, head_idx, batch_idx = work_tile.tile_idx
+            score_mod = partial(self.score_mod, softcap_val=softcap_val)
+            mma_one_n_block = partial(
+                mma_one_n_block_all, softmax=softmax, scoremod_premask_fn=score_mod,
+                batch_idx=batch_idx, head_idx=head_idx, m_block=m_block
+            )
             seqlen = SeqlenInfoCls(batch_idx)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
@@ -1637,7 +1642,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     zero_init=True, wg_wait=0
                 )
                 pipeline_k.consumer_release(kv_consumer_state)
-                scoremod_premask_fn(acc_S)
+                score_mod(acc_S)
                 # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
                 mask_fn(acc_S, n_block=n_block_max - 1, mask_seqlen=True)
                 # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
@@ -1744,6 +1749,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
         scoremod_premask_fn: Callable,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        m_block: cutlass.Int32,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
@@ -1761,7 +1769,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(0)
         pipeline_k.consumer_release(smem_pipe_read)
-        scoremod_premask_fn(acc_S)
+        if cutlass.const_expr(scoremod_premask_fn is not None):
+            scoremod_premask_fn(acc_S, batch_idx, head_idx, q_idx=m_block, kv_idx=n_block)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
@@ -1803,6 +1812,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
         scoremod_premask_fn: Callable,
+        batch_idx: cutlass.Int32,
+        head_idx: cutlass.Int32,
+        m_block: cutlass.Int32,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
         O_should_accumulate: cutlass.Boolean = True,
@@ -1828,7 +1840,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.warp_scheduler_barrier_arrive()
         warpgroup.wait_group(1)
         pipeline_k.consumer_release(smem_pipe_read)
-        scoremod_premask_fn(acc_S)
+        if cutlass.const_expr(scoremod_premask_fn is not None):
+            scoremod_premask_fn(acc_S, batch_idx, head_idx, q_idx=m_block, kv_idx=n_block)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
