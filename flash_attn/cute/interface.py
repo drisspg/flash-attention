@@ -361,6 +361,7 @@ def _flash_attn_fwd(
     if aux_tensors is not None:
         cute_aux_tensors = [from_dlpack(buf) for buf in aux_tensors]
 
+    print(f"Score_mod: {score_mod}")
     compile_key = (
         dtype,
         head_dim,
@@ -386,6 +387,7 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
     )
+    print(f"Compile key: {compile_key}")
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
