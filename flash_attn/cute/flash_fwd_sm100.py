@@ -22,10 +22,77 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+
+# Profiler imports (optional dependency)
+try:
+    from transformer_nuggets.cute.profiler import (
+        profile_session,
+        group_by_unit,
+        rename_processes,
+    )
+    from transformer_nuggets.cute.profiler.ops import profile_region, warp_start, warp_stop
+    HAS_PROFILER = True
+except ImportError:
+    HAS_PROFILER = False
+
+# Profiler tag IDs for per-tile events (fine-grained profiling only)
+# Event index = tile_idx * NUM_TILE_SUBTAGS + subtag_offset
+TAG_LOAD_TILE_OFFSET = 0      # Per-tile load (unused, kept for index stability)
+TAG_MMA_PROLOGUE_OFFSET = 1   # Initial Q*K0, Q*K1 -> S0, S1
+TAG_MMA_LOOP_OFFSET = 2       # Main K-tile loop (unused, kept for index stability)
+TAG_MMA_PV_OFFSET = 3         # P*V GEMMs within loop (accumulated)
+TAG_MMA_QK_OFFSET = 4         # Q*K GEMMs within loop (accumulated)
+TAG_MMA_EPILOGUE_OFFSET = 5   # Final PV computation
+TAG_SOFTMAX0_TILE_OFFSET = 6  # Per-tile softmax stage 0 (unused)
+TAG_SOFTMAX1_TILE_OFFSET = 7  # Per-tile softmax stage 1 (unused)
+TAG_CORRECTION_TILE_OFFSET = 8  # Per-tile correction (unused)
+TAG_EPILOGUE_TILE_OFFSET = 9  # Per-tile epilogue
+TAG_SOFTMAX_WAIT_OFFSET = 10  # Time waiting for S from MMA (per K-block)
+TAG_SOFTMAX0_COMPUTE_OFFSET = 11  # Softmax0 compute (per K-block)
+TAG_SOFTMAX1_COMPUTE_OFFSET = 12  # Softmax1 compute (per K-block)
+TAG_SOFTMAX_STORE_OFFSET = 13  # Store P to TMEM
+TAG_CORRECTION_RESCALE_OFFSET = 14  # Per-iteration rescale in correction loop
+TAG_CORRECTION_FINAL_OFFSET = 15    # Final correction + epilogue
+TAG_LOAD_STALL_OFFSET = 16    # Load warp blocked waiting for buffer space
+TAG_LOAD_ISSUE_OFFSET = 17    # Load warp issuing TMA commands
+TAG_LOAD_Q_OFFSET = 18        # Q TMA loads (Q0 + Q1)
+TAG_TMEM_LOAD_S_OFFSET = 19   # Wait for S from MMA + load from TMEM
+TAG_TMEM_STORE_P_OFFSET = 20  # Store P to TMEM + fence
+NUM_TILE_SUBTAGS = 21
+
+PROFILER_TAG_NAMES = [
+    "load_tile", "mma_prologue", "mma_loop", "mma_pv", "mma_qk", "mma_epilogue",
+    "softmax0_tile", "softmax1_tile", "correction_tile", "epilogue_tile",
+    "softmax_wait", "softmax0_compute", "softmax1_compute", "softmax_store",
+    "correction_rescale", "correction_final", "load_stall", "load_issue",
+    "load_q", "tmem_load_s", "tmem_store_p",
+]
+# Tag indices for warp_stop (matches PROFILER_TAG_NAMES order)
+TAG_LOAD_TILE = 0
+TAG_MMA_PROLOGUE = 1
+TAG_MMA_LOOP = 2
+TAG_MMA_PV = 3
+TAG_MMA_QK = 4
+TAG_MMA_EPILOGUE = 5
+TAG_SOFTMAX0_TILE = 6
+TAG_SOFTMAX1_TILE = 7
+TAG_CORRECTION_TILE = 8
+TAG_EPILOGUE_TILE = 9
+TAG_SOFTMAX_WAIT = 10
+TAG_SOFTMAX0_COMPUTE = 11
+TAG_SOFTMAX1_COMPUTE = 12
+TAG_SOFTMAX_STORE = 13
+TAG_CORRECTION_RESCALE = 14
+TAG_CORRECTION_FINAL = 15
+TAG_LOAD_STALL = 16
+TAG_LOAD_ISSUE = 17
+TAG_LOAD_Q = 18
+TAG_TMEM_LOAD_S = 19
+TAG_TMEM_STORE_P = 20
 
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
@@ -262,6 +329,9 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        # Profiler arguments (optional - pass via profile_session context)
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -275,7 +345,15 @@ class FlashAttentionForwardSm100:
         4. Configuration of TMA (Tensor Memory Access) operations
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
+
+        Profiling:
+            Use profile_session from transformer_nuggets.cute.profiler and pass
+            prof_buf=prof.to_cute(), prof_max_events=Int32(prof.max_events_per_unit).
+            Each SM worker is a profiling unit; each warp role gets its own tag.
+            View the trace at https://ui.perfetto.dev/
         """
+        # Store profiler enabled flag (compile-time constant)
+        self.prof_enabled = cutlass.const_expr(prof_buf is not None)
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -705,6 +783,8 @@ class FlashAttentionForwardSm100:
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            prof_buf,
+            prof_max_events,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -750,6 +830,9 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        # Profiler arguments
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -766,6 +849,8 @@ class FlashAttentionForwardSm100:
         """
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        # Profiler unit_id = SM worker index (block_idx.x for persistent scheduler)
+        prof_unit_id = Int32(cute.arch.block_idx()[0])
 
         # Prefetch tma descriptor
         if warp_idx == 0:
@@ -969,6 +1054,9 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                prof_buf,
+                prof_max_events,
+                prof_unit_id,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -999,6 +1087,9 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                prof_buf,
+                prof_max_events,
+                prof_unit_id,
             )
 
             # if warp_idx == self.mma_warp_id:
@@ -1030,6 +1121,9 @@ class FlashAttentionForwardSm100:
                     num_splits,
                     SeqlenInfoCls,
                     TileSchedulerCls,
+                    prof_buf,
+                    prof_max_events,
+                    prof_unit_id,
                 )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1038,6 +1132,7 @@ class FlashAttentionForwardSm100:
         if warp_idx < self.correction_warp_ids[0]:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
+
             softmax_loop = partial(
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
@@ -1055,6 +1150,9 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
+                prof_buf=prof_buf,
+                prof_max_events=prof_max_events,
+                prof_unit_id=prof_unit_id,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1066,17 +1164,18 @@ class FlashAttentionForwardSm100:
                         + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]),
                         tStS.layout,
                     ),
+                    softmax_warp_id=Int32(self.softmax0_warp_ids[0]) if stage == 0 else Int32(self.softmax1_warp_ids[0]),
                 )
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
                 if warp_idx < self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                    softmax_loop(stage=0, tStSi=tStSi)
+                    softmax_loop(stage=0, tStSi=tStSi, softmax_warp_id=Int32(self.softmax0_warp_ids[0]))
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
                     tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                    softmax_loop(stage=1, tStSi=tStSi)
+                    softmax_loop(stage=1, tStSi=tStSi, softmax_warp_id=Int32(self.softmax1_warp_ids[0]))
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1103,6 +1202,9 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
+                prof_buf,
+                prof_max_events,
+                prof_unit_id,
             )
             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
@@ -1130,6 +1232,10 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        # Profiler args
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
+        prof_unit_id: Int32 = Int32(0),
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1139,6 +1245,7 @@ class FlashAttentionForwardSm100:
         )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        tile_idx = Int32(0)  # Track tile index for per-tile profiling
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
@@ -1241,11 +1348,22 @@ class FlashAttentionForwardSm100:
                 K_or_V="V",
             )
 
+            # Per-iteration load profiling: event space at 3000 + tile_idx * 200 + iter
+            load_iter_idx = Int32(0)
+
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
                 )
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+                    # Time Q loads (Q0 + Q1 together)
+                    load_q_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_LOAD_Q_OFFSET
+                    load_q_start = Int64(0)
+                    if const_expr(self.prof_enabled):
+                        load_q_start = warp_start(
+                            prof_buf, prof_unit_id, load_q_event_idx,
+                            prof_max_events, Int32(self.load_warp_ids[0]),
+                        )
                     if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
                         load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
@@ -1260,9 +1378,18 @@ class FlashAttentionForwardSm100:
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):
                         load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
+                    # Stop Q load timing (includes Q0, K0, Q1 issue)
+                    if const_expr(self.prof_enabled):
+                        warp_stop(
+                            prof_buf, prof_unit_id, load_q_event_idx, load_q_start,
+                            Int32(TAG_LOAD_Q), Int32(self.load_warp_ids[0]),
+                            prof_max_events, Int32(self.load_warp_ids[0]),
+                        )
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                     kv_producer_state.advance()
+
+                    # ==================== LOAD KV LOOP ====================
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
                         page_idx = (
@@ -1272,11 +1399,25 @@ class FlashAttentionForwardSm100:
                         )
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
-                    # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
+                        # Time per-iteration K+V load (includes stall waiting for buffer + TMA issue)
+                        load_iter_start = Int64(0)
+                        if const_expr(self.prof_enabled):
+                            load_iter_event_idx = Int32(3000) + tile_idx * Int32(200) + load_iter_idx
+                            load_iter_start = warp_start(
+                                prof_buf, prof_unit_id, load_iter_event_idx,
+                                prof_max_events, Int32(self.load_warp_ids[0]),
+                            )
                         load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
                         kv_producer_state.advance()
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
                         kv_producer_state.advance()
+                        if const_expr(self.prof_enabled):
+                            warp_stop(
+                                prof_buf, prof_unit_id, load_iter_event_idx, load_iter_start,
+                                Int32(TAG_LOAD_ISSUE), Int32(self.load_warp_ids[0]),
+                                prof_max_events, Int32(self.load_warp_ids[0]),
+                            )
+                            load_iter_idx += 1
 
             else:
                 kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
@@ -1293,7 +1434,7 @@ class FlashAttentionForwardSm100:
                     q_producer_phase,
                 )
 
-
+            tile_idx += 1
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1317,6 +1458,10 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        # Profiler args
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
+        prof_unit_id: Int32 = Int32(0),
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1358,6 +1503,7 @@ class FlashAttentionForwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        tile_idx = Int32(0)  # Track tile index for per-tile profiling
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
@@ -1377,43 +1523,56 @@ class FlashAttentionForwardSm100:
                     process_tile = n_block_min < n_block_max
 
             if process_tile:
+                # Compute per-tile event indices for fine-grained profiling
+                prologue_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_MMA_PROLOGUE_OFFSET
+                epilogue_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_MMA_EPILOGUE_OFFSET
+                
+                # ==================== MMA PROLOGUE ====================
+                # Initial Q*K0 -> S0, Q*K1 -> S1
+                prologue_start_ns = Int64(0)
+                if const_expr(self.prof_enabled):
+                    prologue_start_ns = warp_start(prof_buf, prof_unit_id, prologue_event_idx,
+                                                   prof_max_events, Int32(self.mma_warp_id))
                 for stage in cutlass.range_constexpr(self.q_stage):
-                    # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
-                    # 1. wait for Q0 / Q1
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_load_q_full_offset + stage, mma_q_consumer_phase
                     )
-                    # 2. wait for K0
                     if const_expr(stage == 0):
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     tSrKi = tSrK[None, None, None, mma_kv_consumer_state.index]
-                    # We don't need to acquire empty S0 / S1.
-                    # For the first iteration, we don't need to wait as we're guaranteed S0 / S1
-                    # are empty. For subsequent iterations, the wait happened at the end
-                    # of the while loop.
-                    # 3. gemm
-                    # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(
                             sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         )
                     gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
-                    # 4. release S0 / S1
                     with cute.arch.elect_one():
                         tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
                 mma_q_consumer_phase ^= 1
-                # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
-                # End of GEMM (Q1 * K0 -> S1)
-                # Note: Q0 & Q1 are still needed in the seqlen_kv loop
-                # so we need to release them after the seqlen_kv loop
+                if const_expr(self.prof_enabled):
+                    warp_stop(prof_buf, prof_unit_id, prologue_event_idx, prologue_start_ns,
+                              Int32(TAG_MMA_PROLOGUE), Int32(self.mma_warp_id), prof_max_events,
+                              Int32(self.mma_warp_id))
+                # End of prologue
 
+                # ==================== MMA MAIN LOOP ====================
                 # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
+                # Use running event counter for per-iteration events
+                # Start after per-tile events: 100 base + tile_idx * 200 events per tile
+                iter_event_base = Int32(100) + tile_idx * Int32(200)
+                iter_event_idx = iter_event_base
                 for i in cutlass.range(block_loop_count, unroll=1):
+                    # Start PV timer for this iteration
+                    pv_iter_start = Int64(0)
+                    qk_iter_start = Int64(0)
+                    if const_expr(self.prof_enabled):
+                        pv_iter_start = warp_start(prof_buf, prof_unit_id, 
+                                                    iter_event_idx,
+                                                    prof_max_events, Int32(self.mma_warp_id))
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -1422,16 +1581,11 @@ class FlashAttentionForwardSm100:
                     tOrVi = tOrV[None, None, None, Vi_index]
                     for stage in cutlass.range_constexpr(2):
                         # 2. acquire corrected O0/O1_partial and P0 / P1
-                        # For the first iteration in this work tile, waiting for O0/O1_partial
-                        # means that the correction warps has finished reading tO during
-                        # the last iteration of the previous work tile has finished.
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                             P_full_O_rescaled_phase,
                         )
-                        # 3. gemm
-                        # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                        # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
+                        # 3. gemm PV
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
@@ -1442,18 +1596,19 @@ class FlashAttentionForwardSm100:
                             mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
                             mbar_phase=P_full_O_rescaled_phase,
                         )
-                        # 4. release accumulated O0_partial / O1_partial
-                        # Don't need to signal O_full to the correction warps anymore since the
-                        # correction warps wait for the softmax warps anyway. By the time the softmax
-                        # warps finished, S_i for the next iteration must have been done, so O_i-1
-                        # must have been done as well.
-                        # with cute.arch.elect_one():
-                        #     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
-                        # 5. release V(i-1)
+                        # Stop PV / Start QK after stage 1 PV
                         if const_expr(stage == 1):
+                            if const_expr(self.prof_enabled):
+                                warp_stop(prof_buf, prof_unit_id, iter_event_idx, pv_iter_start,
+                                          Int32(TAG_MMA_PV), Int32(self.mma_warp_id), prof_max_events,
+                                          Int32(self.mma_warp_id))
+                                iter_event_idx += 1
+                                qk_iter_start = warp_start(prof_buf, prof_unit_id,
+                                                            iter_event_idx,
+                                                            prof_max_events, Int32(self.mma_warp_id))
                             pipeline_kv.consumer_release(mma_kv_release_state)
                             mma_kv_release_state.advance()
-                        # End of GEMM_PV00 (P0 * V0 -> O0_partial)
+                        # End of GEMM_PV
 
                         # GEMM_QK0i (Q0 * Ki -> S0)
                         # 1. wait for Ki
@@ -1461,11 +1616,7 @@ class FlashAttentionForwardSm100:
                             mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
                         Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        # 2. gemm
-                        # Don't need to wait for the softmax warp to have finished reading the previous
-                        # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
-                        # has been read and Pi has been written.
-                        # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
+                        # 2. gemm QK
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
@@ -1473,7 +1624,13 @@ class FlashAttentionForwardSm100:
                         # 3. release S0
                         with cute.arch.elect_one():
                             tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
-                        # End of GEMM_QK0i (Q0 * Ki -> S0)
+                        # End of GEMM_QK
+                    # Stop QK timer after stage 1 QK
+                    if const_expr(self.prof_enabled):
+                        warp_stop(prof_buf, prof_unit_id, iter_event_idx, qk_iter_start,
+                                  Int32(TAG_MMA_QK), Int32(self.mma_warp_id), prof_max_events,
+                                  Int32(self.mma_warp_id))
+                        iter_event_idx += 1  # Next event slot
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
@@ -1486,6 +1643,12 @@ class FlashAttentionForwardSm100:
                     for stage in cutlass.range_constexpr(self.q_stage):
                         tcgen05.commit(mbar_ptr + self.mbar_load_q_empty_offset + stage)
 
+                # ==================== MMA EPILOGUE ====================
+                # Final PV computation
+                epilogue_start_ns = Int64(0)
+                if const_expr(self.prof_enabled):
+                    epilogue_start_ns = warp_start(prof_buf, prof_unit_id, epilogue_event_idx,
+                                                   prof_max_events, Int32(self.mma_warp_id))
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                 # 1. wait for V0
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -1497,8 +1660,6 @@ class FlashAttentionForwardSm100:
                         mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase
                     )
                     # 3. gemm
-                    # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                    # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
@@ -1510,20 +1671,19 @@ class FlashAttentionForwardSm100:
                         mbar_phase=P_full_O_rescaled_phase,
                     )
                     # 4. release accumulated O0_partial
-                    # We do need O_full here since for the last tile, by the time the softmax warp
-                    # has signaled to the correction warps, the softmax warp has just finished compute
-                    # the row sum of the current tile. It does not guarantee that the 1st tile
-                    # of the next work tile has been computed yet.
                     with cute.arch.elect_one():
                         tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
-                    # End of GEMM_PV00 (P0 * V0 -> O0_partial)
                 P_full_O_rescaled_phase ^= 1
                 # 5. release Vi_end
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
-                # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
+                if const_expr(self.prof_enabled):
+                    warp_stop(prof_buf, prof_unit_id, epilogue_event_idx, epilogue_start_ns,
+                              Int32(TAG_MMA_EPILOGUE), Int32(self.mma_warp_id), prof_max_events,
+                              Int32(self.mma_warp_id))
 
             # Advance to next tile
+            tile_idx += 1
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
@@ -1550,6 +1710,11 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        # Profiler args
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
+        prof_unit_id: Int32 = Int32(0),
+        softmax_warp_id: Int32 = Int32(0),
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1612,7 +1777,13 @@ class FlashAttentionForwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        tile_idx = Int32(0)  # Track tile index for per-tile profiling
         while work_tile.is_valid_tile:
+            # Per-iteration (per K-block) softmax timing
+            # Use stage offset to avoid softmax0/softmax1 event collision
+            softmax_iter_idx = Int32(0)
+            softmax_stage_event_offset = Int32(0 if stage == 0 else 100)  # stage offset within 200 stride
+
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -1700,6 +1871,11 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                # Profiler params for TMEM timing
+                prof_buf=prof_buf,
+                prof_max_events=prof_max_events,
+                prof_unit_id=prof_unit_id,
+                softmax_warp_id=softmax_warp_id,
             )
 
             if has_work:
@@ -1755,6 +1931,13 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
+                    # Calculate event indices (always, for passing to softmax_step)
+                    sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
+                    tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                    # Time individual softmax_step calls
+                    if const_expr(self.prof_enabled):
+                        sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
+                                                   prof_max_events, softmax_warp_id)
                     mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
                         mma_si_consumer_phase,
                         si_corr_producer_phase,
@@ -1762,7 +1945,13 @@ class FlashAttentionForwardSm100:
                         n_block_max - 1,
                         is_first=True,
                         mask_fn=partial(mask_fn, mask_seqlen=True),
+                        tmem_event_idx=tmem_iter_event_idx,
                     )
+                    if const_expr(self.prof_enabled):
+                        warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
+                                  Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                  softmax_warp_id)
+                        softmax_iter_idx += 1
                     n_block_max -= 1
                     # Next couple of iterations with causal masking
                     if const_expr(self.is_causal or self.is_local):
@@ -1771,6 +1960,11 @@ class FlashAttentionForwardSm100:
                         )
                         for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                             n_block = n_block_max - 1 - n_tile
+                            sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
+                            tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                            if const_expr(self.prof_enabled):
+                                sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
+                                                           prof_max_events, softmax_warp_id)
                             mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = (
                                 softmax_step(
                                     mma_si_consumer_phase,
@@ -1778,8 +1972,14 @@ class FlashAttentionForwardSm100:
                                     s0_s1_sequence_phase,
                                     n_block,
                                     mask_fn=partial(mask_fn, mask_seqlen=False),
+                                    tmem_event_idx=tmem_iter_event_idx,
                                 )
                             )
+                            if const_expr(self.prof_enabled):
+                                warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
+                                          Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                          softmax_warp_id)
+                                softmax_iter_idx += 1
                         n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
                     # The remaining iterations have no masking (but may still need mask_mod)
                     n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
@@ -1787,20 +1987,37 @@ class FlashAttentionForwardSm100:
                     )
                     for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                         n_block = n_block_max - n_tile - 1
+                        sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
+                        tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                        if const_expr(self.prof_enabled):
+                            sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
+                                                       prof_max_events, softmax_warp_id)
                         if const_expr(self.mask_mod is not None):
                             mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
                                 mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
                                 mask_fn=partial(mask_fn, mask_seqlen=False),
+                                tmem_event_idx=tmem_iter_event_idx,
                             )
                         else:
                             mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
                                 mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
+                                tmem_event_idx=tmem_iter_event_idx,
                             )
+                        if const_expr(self.prof_enabled):
+                            warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
+                                      Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                      softmax_warp_id)
+                            softmax_iter_idx += 1
                     # Separate iterations with local masking on the left
                     if const_expr(self.is_local and block_info.window_size_left is not None):
                         n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
                         for n_tile in cutlass.range(0, n_block_max - n_block_min, unroll=1):
                             n_block = n_block_max - 1 - n_tile
+                            sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
+                            tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                            if const_expr(self.prof_enabled):
+                                sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
+                                                           prof_max_events, softmax_warp_id)
                             mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = (
                                 softmax_step(
                                     mma_si_consumer_phase,
@@ -1808,8 +2025,14 @@ class FlashAttentionForwardSm100:
                                     s0_s1_sequence_phase,
                                     n_block,
                                     mask_fn=partial(mask_fn, mask_seqlen=False),
+                                    tmem_event_idx=tmem_iter_event_idx,
                                 )
                             )
+                            if const_expr(self.prof_enabled):
+                                warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
+                                          Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                          softmax_warp_id)
+                                softmax_iter_idx += 1
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
@@ -1840,6 +2063,7 @@ class FlashAttentionForwardSm100:
             #         gLSE[tidx] = lse
 
             # Advance to next tile
+            tile_idx += 1
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
@@ -1871,6 +2095,12 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        # Profiler params for TMEM timing
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
+        prof_unit_id: Int32 = Int32(0),
+        softmax_warp_id: Int32 = Int32(0),
+        tmem_event_idx: Int32 = Int32(0),
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -1892,10 +2122,22 @@ class FlashAttentionForwardSm100:
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
         tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
 
+        # Time TMEM load S (wait for S from MMA + load from TMEM to registers)
+        tmem_load_s_start = Int64(0)
+        if const_expr(self.prof_enabled):
+            tmem_load_s_start = warp_start(
+                prof_buf, prof_unit_id, tmem_event_idx,
+                prof_max_events, softmax_warp_id,
+            )
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        if const_expr(self.prof_enabled):
+            warp_stop(
+                prof_buf, prof_unit_id, tmem_event_idx, tmem_load_s_start,
+                Int32(TAG_TMEM_LOAD_S), softmax_warp_id, prof_max_events, softmax_warp_id,
+            )
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,
@@ -1949,6 +2191,13 @@ class FlashAttentionForwardSm100:
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
+        # Time TMEM store P (store to TMEM + fence + signal)
+        tmem_store_p_start = Int64(0)
+        if const_expr(self.prof_enabled):
+            tmem_store_p_start = warp_start(
+                prof_buf, prof_unit_id, tmem_event_idx + Int32(1),  # +1 to avoid collision with tmem_load_s
+                prof_max_events, softmax_warp_id,
+            )
         # print(tSrP_r2t_f32, tStP_r2t)
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
         for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
@@ -1963,6 +2212,12 @@ class FlashAttentionForwardSm100:
         cute.arch.fence_view_async_tmem_store()
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        if const_expr(self.prof_enabled):
+            warp_stop(
+                prof_buf, prof_unit_id, tmem_event_idx + Int32(1), tmem_store_p_start,
+                Int32(TAG_TMEM_STORE_P), softmax_warp_id, prof_max_events, softmax_warp_id,
+            )
+
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
@@ -1991,6 +2246,10 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        # Profiler args
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
+        prof_unit_id: Int32 = Int32(0),
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -2019,6 +2278,7 @@ class FlashAttentionForwardSm100:
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
+        tile_idx = Int32(0)  # Track tile index for per-tile profiling
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
@@ -2052,7 +2312,17 @@ class FlashAttentionForwardSm100:
                 softmax_corr_consumer_phase ^= 1
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
+                # Per-iteration rescale profiling: event space at 2000 + tile_idx * 200 + iter
+                corr_iter_idx = Int32(0)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
+                    # Time the rescale work (after barrier wait, before arrive)
+                    corr_rescale_start = Int64(0)
+                    if const_expr(self.prof_enabled):
+                        corr_iter_event_idx = Int32(2000) + tile_idx * Int32(200) + corr_iter_idx
+                        corr_rescale_start = warp_start(
+                            prof_buf, prof_unit_id, corr_iter_event_idx,
+                            prof_max_events, Int32(self.correction_warp_ids[0]),
+                        )
                     for stage in cutlass.range_constexpr(2):
                         # wait for S0 / S1
                         cute.arch.mbarrier_wait(
@@ -2077,10 +2347,27 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_arrive(
                             mbar_ptr + self.mbar_softmax_corr_empty_offset + (1 - stage)
                         )
+                    # Stop rescale timing after both stages
+                    if const_expr(self.prof_enabled):
+                        warp_stop(
+                            prof_buf, prof_unit_id, corr_iter_event_idx, corr_rescale_start,
+                            Int32(TAG_CORRECTION_RESCALE), Int32(self.correction_warp_ids[0]),
+                            prof_max_events, Int32(self.correction_warp_ids[0]),
+                        )
+                        corr_iter_idx += 1
                     softmax_corr_consumer_phase ^= 1
                     # o_corr_consumer_phase ^= 1
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 1)
                 # End of seqlen_corr_loop_steps
+
+                # Start timing final correction phase
+                corr_final_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_CORRECTION_FINAL_OFFSET
+                corr_final_start = Int64(0)
+                if const_expr(self.prof_enabled):
+                    corr_final_start = warp_start(
+                        prof_buf, prof_unit_id, corr_final_event_idx,
+                        prof_max_events, Int32(self.correction_warp_ids[0]),
+                    )
 
                 # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
                 # additional sync because the MMA in the top half must have been done.
@@ -2151,6 +2438,14 @@ class FlashAttentionForwardSm100:
                     # mma warp can write to them
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
+
+                # Stop timing final correction phase (after both stages complete)
+                if const_expr(self.prof_enabled):
+                    warp_stop(
+                        prof_buf, prof_unit_id, corr_final_event_idx, corr_final_start,
+                        Int32(TAG_CORRECTION_FINAL), Int32(self.correction_warp_ids[0]),
+                        prof_max_events, Int32(self.correction_warp_ids[0]),
+                    )
 
                 o_corr_consumer_phase ^= 1
                 softmax_corr_consumer_phase ^= 1
@@ -2239,6 +2534,7 @@ class FlashAttentionForwardSm100:
                         gLSE[tidx] = lse
 
             # Advance to next tile
+            tile_idx += 1
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
@@ -2445,11 +2741,21 @@ class FlashAttentionForwardSm100:
         num_splits: int,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        # Profiler args
+        prof_buf: Optional[cute.Tensor] = None,
+        prof_max_events: Int32 = Int32(0),
+        prof_unit_id: Int32 = Int32(0),
     ):
         epi_consumer_phase = Int32(0)
+        tile_idx = Int32(0)  # Track tile index for per-tile profiling
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
+            epilogue_tile_event_idx = (
+                tile_idx * NUM_TILE_SUBTAGS + TAG_EPILOGUE_TILE_OFFSET
+            )
+            epilogue_tile_start_ns = Int64(0)
+            # Note: warp_start moved to after barrier waits (inside the if blocks below)
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -2470,6 +2776,13 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
                         )
+                    # Start timing AFTER barrier waits (only time actual copy work)
+                    if const_expr(self.prof_enabled):
+                        epilogue_tile_start_ns = warp_start(
+                            prof_buf, prof_unit_id, epilogue_tile_event_idx,
+                            prof_max_events, Int32(self.epilogue_warp_ids[0]),
+                        )
+                    for stage in cutlass.range_constexpr(self.q_stage):
                         # 2. copy O0 / O1 to gmem
                         store_O(src_idx=stage, dst_idx=self.q_stage * m_block + stage)
                         cute.arch.cp_async_bulk_commit_group()
@@ -2502,6 +2815,13 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
                         )
+                    # Start timing AFTER barrier waits (only time actual copy work)
+                    if const_expr(self.prof_enabled):
+                        epilogue_tile_start_ns = warp_start(
+                            prof_buf, prof_unit_id, epilogue_tile_event_idx,
+                            prof_max_events, Int32(self.epilogue_warp_ids[0]),
+                        )
+                    for stage in cutlass.range_constexpr(self.q_stage):
                         # 2. copy O0 / O1 to gmem
                         # load acc O from smem to rmem for wider vectorization
                         tOrO = cute.make_fragment_like(tOsO[None, None, None, 0], self.o_dtype)
@@ -2536,7 +2856,21 @@ class FlashAttentionForwardSm100:
 
                 epi_consumer_phase ^= 1
 
+            # End per-tile epilogue profiling
+            if const_expr(self.prof_enabled):
+                warp_stop(
+                    prof_buf,
+                    prof_unit_id,
+                    epilogue_tile_event_idx,
+                    epilogue_tile_start_ns,
+                    Int32(TAG_EPILOGUE_TILE),
+                    Int32(self.epilogue_warp_ids[0]),
+                    prof_max_events,
+                    Int32(self.epilogue_warp_ids[0]),
+                )
+
             # Advance to next tile
+            tile_idx += 1
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
