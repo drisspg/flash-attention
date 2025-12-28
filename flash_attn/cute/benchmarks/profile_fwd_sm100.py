@@ -136,9 +136,47 @@ def main():
     print(f"  trace_path          = {trace_path}")
     print(f"  tags                = {PROFILER_TAG_NAMES}")
 
-    # Create process names for all SM workers (zero-padded for correct sorting in Perfetto)
-    num_digits = len(str(num_sm_workers - 1))  # e.g., 148 SMs -> 3 digits
-    process_names = {i: f"SM {i:0{num_digits}d}" for i in range(num_sm_workers)}
+    # Create process names for all SM workers (simple numbering: SM 0, SM 1, ...)
+    process_names = {i: f"SM {i}" for i in range(num_sm_workers)}
+
+    def add_sort_index(trace: dict, ctx) -> dict:
+        """Add process_sort_index metadata with correct format for Perfetto (PR 3273).
+
+        Format: {"name": "process_sort_index", "ph": "M", "pid": X, "tid": 0, "args": {"sort_index": N}}
+        Lower sort_index values appear higher in the UI.
+        """
+        # Find all unique pids in the trace
+        pids = set()
+        for event in trace["traceEvents"]:
+            pid = event.get("pid")
+            if pid is not None:
+                pids.add(pid)
+
+        # Create sort_index events for each pid, sorted by pid
+        # Match PR 3273 format exactly - no extra fields like ts or cat
+        sort_events = []
+        for pid in sorted(pids):
+            sort_events.append(
+                {
+                    "name": "process_sort_index",
+                    "ph": "M",
+                    "pid": pid,
+                    "tid": 0,
+                    "args": {"sort_index": pid},
+                }
+            )
+
+        # Prepend sort_index events to the beginning of the trace
+        trace["traceEvents"] = sort_events + trace["traceEvents"]
+        return trace
+
+    def compose(*funcs):
+        def composed(trace, ctx):
+            for f in funcs:
+                trace = f(trace, ctx)
+            return trace
+
+        return composed
 
     with profile_session(
         max_events_per_unit=max_events_per_unit,
@@ -147,7 +185,7 @@ def main():
         trace_path=trace_path,
         device=device,
         post_process_events=group_by_unit,
-        post_process_trace=rename_processes(process_names),
+        post_process_trace=compose(rename_processes(process_names), add_sort_index),
     ) as (prof, tag_table):
         # Convert prof buffer to cute tensor
         prof_buf_cute = from_dlpack(prof.tensor)
@@ -198,14 +236,17 @@ def main():
     )
     print("  - Per-tile tags:")
     print("    * load_q - Q TMA loads (Q0 + Q1)")
-    print("    * load_issue - Per K-block K+V TMA load (includes stall + issue)")
-    print("    * mma_prologue/epilogue, mma_pv/qk (per GEMM iteration)")
+    print("    * load_tma - Per K-block K+V TMA load (includes stall + issue)")
+    print("    * mma_prologue/epilogue, mma_qk (per GEMM iteration)")
+    print("    * mma_pv_wait - Time MMA waits for P from softmax")
+    print("    * mma_pv_gemm - Time issuing P*V GEMM instructions")
     print("    * softmax0_compute, softmax1_compute (per K-block softmax_step)")
     print("    * tmem_load_s - Wait for S from MMA + TMEM load (per K-block)")
     print("    * tmem_store_p - Store P to TMEM + fence (per K-block)")
+    print("    * score_mod - score_mod application (per K-block, if present)")
+    print("    * mask_mod - mask_mod application (per K-block, if present)")
     print("    * correction_rescale (per K-block), correction_final (normalization + sO store)")
     print("    * epilogue_tile (after barrier wait)")
-    print("  - Timing excludes barrier waits for accurate compute measurement")
 
 
 if __name__ == "__main__":

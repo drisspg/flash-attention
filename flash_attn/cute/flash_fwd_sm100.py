@@ -39,60 +39,61 @@ try:
 except ImportError:
     HAS_PROFILER = False
 
-# Profiler tag IDs for per-tile events (fine-grained profiling only)
-# Event index = tile_idx * NUM_TILE_SUBTAGS + subtag_offset
-TAG_LOAD_TILE_OFFSET = 0      # Per-tile load (unused, kept for index stability)
-TAG_MMA_PROLOGUE_OFFSET = 1   # Initial Q*K0, Q*K1 -> S0, S1
-TAG_MMA_LOOP_OFFSET = 2       # Main K-tile loop (unused, kept for index stability)
-TAG_MMA_PV_OFFSET = 3         # P*V GEMMs within loop (accumulated)
-TAG_MMA_QK_OFFSET = 4         # Q*K GEMMs within loop (accumulated)
-TAG_MMA_EPILOGUE_OFFSET = 5   # Final PV computation
-TAG_SOFTMAX0_TILE_OFFSET = 6  # Per-tile softmax stage 0 (unused)
-TAG_SOFTMAX1_TILE_OFFSET = 7  # Per-tile softmax stage 1 (unused)
-TAG_CORRECTION_TILE_OFFSET = 8  # Per-tile correction (unused)
-TAG_EPILOGUE_TILE_OFFSET = 9  # Per-tile epilogue
-TAG_SOFTMAX_WAIT_OFFSET = 10  # Time waiting for S from MMA (per K-block)
-TAG_SOFTMAX0_COMPUTE_OFFSET = 11  # Softmax0 compute (per K-block)
-TAG_SOFTMAX1_COMPUTE_OFFSET = 12  # Softmax1 compute (per K-block)
-TAG_SOFTMAX_STORE_OFFSET = 13  # Store P to TMEM
-TAG_CORRECTION_RESCALE_OFFSET = 14  # Per-iteration rescale in correction loop
-TAG_CORRECTION_FINAL_OFFSET = 15    # Final correction + epilogue
-TAG_LOAD_STALL_OFFSET = 16    # Load warp blocked waiting for buffer space
-TAG_LOAD_ISSUE_OFFSET = 17    # Load warp issuing TMA commands
-TAG_LOAD_Q_OFFSET = 18        # Q TMA loads (Q0 + Q1)
-TAG_TMEM_LOAD_S_OFFSET = 19   # Wait for S from MMA + load from TMEM
-TAG_TMEM_STORE_P_OFFSET = 20  # Store P to TMEM + fence
-NUM_TILE_SUBTAGS = 21
+class ProfilerTag(enum.IntEnum):
+    """Profiler tags for intra-kernel tracing.
 
-PROFILER_TAG_NAMES = [
-    "load_tile", "mma_prologue", "mma_loop", "mma_pv", "mma_qk", "mma_epilogue",
-    "softmax0_tile", "softmax1_tile", "correction_tile", "epilogue_tile",
-    "softmax_wait", "softmax0_compute", "softmax1_compute", "softmax_store",
-    "correction_rescale", "correction_final", "load_stall", "load_issue",
-    "load_q", "tmem_load_s", "tmem_store_p",
-]
-# Tag indices for warp_stop (matches PROFILER_TAG_NAMES order)
-TAG_LOAD_TILE = 0
-TAG_MMA_PROLOGUE = 1
-TAG_MMA_LOOP = 2
-TAG_MMA_PV = 3
-TAG_MMA_QK = 4
-TAG_MMA_EPILOGUE = 5
-TAG_SOFTMAX0_TILE = 6
-TAG_SOFTMAX1_TILE = 7
-TAG_CORRECTION_TILE = 8
-TAG_EPILOGUE_TILE = 9
-TAG_SOFTMAX_WAIT = 10
-TAG_SOFTMAX0_COMPUTE = 11
-TAG_SOFTMAX1_COMPUTE = 12
-TAG_SOFTMAX_STORE = 13
-TAG_CORRECTION_RESCALE = 14
-TAG_CORRECTION_FINAL = 15
-TAG_LOAD_STALL = 16
-TAG_LOAD_ISSUE = 17
-TAG_LOAD_Q = 18
-TAG_TMEM_LOAD_S = 19
-TAG_TMEM_STORE_P = 20
+    Each tag identifies an event type. The integer value is used as both:
+    - The index into PROFILER_TAG_NAMES for the event name
+    - The per-tile event offset: event_idx = tile_idx * NUM_TAGS + tag
+    """
+    LOAD_TILE = 0
+    MMA_PROLOGUE = 1
+    MMA_LOOP = 2
+    MMA_PV = 3
+    MMA_QK = 4
+    MMA_EPILOGUE = 5
+    SOFTMAX0_TILE = 6
+    SOFTMAX1_TILE = 7
+    CORRECTION_TILE = 8
+    EPILOGUE_TILE = 9
+    SOFTMAX_WAIT = 10
+    SOFTMAX0_COMPUTE = 11
+    SOFTMAX1_COMPUTE = 12
+    SOFTMAX_STORE = 13
+    CORRECTION_RESCALE = 14
+    CORRECTION_FINAL = 15
+    LOAD_STALL = 16
+    LOAD_TMA = 17
+    LOAD_Q = 18
+    TMEM_LOAD_S = 19
+    TMEM_STORE_P = 20
+    MMA_PV_WAIT = 21
+    MMA_PV_GEMM = 22
+    SCORE_MOD = 23
+    MASK_MOD = 24
+
+
+NUM_TAGS = len(ProfilerTag)
+PROFILER_TAG_NAMES = [tag.name.lower() for tag in ProfilerTag]
+
+
+class IterEventBase(enum.IntEnum):
+    """Base offsets for per-iteration profiling events.
+
+    Event index = BASE + tile_idx * STRIDE + iteration_idx
+    """
+    MMA = 100
+    SOFTMAX = 1000
+    CORRECTION = 2000
+    LOAD = 3000
+    TMEM = 4000
+    MMA_PV = 6000
+    SCORE_MOD = 7000
+    MASK_MOD = 7500
+
+
+ITER_STRIDE_SMALL = 200
+ITER_STRIDE_LARGE = 400
 
 from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
@@ -1357,7 +1358,7 @@ class FlashAttentionForwardSm100:
                 )
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     # Time Q loads (Q0 + Q1 together)
-                    load_q_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_LOAD_Q_OFFSET
+                    load_q_event_idx = tile_idx * NUM_TAGS + ProfilerTag.LOAD_Q
                     load_q_start = Int64(0)
                     if const_expr(self.prof_enabled):
                         load_q_start = warp_start(
@@ -1382,7 +1383,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.prof_enabled):
                         warp_stop(
                             prof_buf, prof_unit_id, load_q_event_idx, load_q_start,
-                            Int32(TAG_LOAD_Q), Int32(self.load_warp_ids[0]),
+                            Int32(ProfilerTag.LOAD_Q), Int32(self.load_warp_ids[0]),
                             prof_max_events, Int32(self.load_warp_ids[0]),
                         )
                     q_producer_phase ^= 1
@@ -1402,7 +1403,7 @@ class FlashAttentionForwardSm100:
                         # Time per-iteration K+V load (includes stall waiting for buffer + TMA issue)
                         load_iter_start = Int64(0)
                         if const_expr(self.prof_enabled):
-                            load_iter_event_idx = Int32(3000) + tile_idx * Int32(200) + load_iter_idx
+                            load_iter_event_idx = Int32(IterEventBase.LOAD) + tile_idx * Int32(ITER_STRIDE_SMALL) + load_iter_idx
                             load_iter_start = warp_start(
                                 prof_buf, prof_unit_id, load_iter_event_idx,
                                 prof_max_events, Int32(self.load_warp_ids[0]),
@@ -1414,7 +1415,7 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.prof_enabled):
                             warp_stop(
                                 prof_buf, prof_unit_id, load_iter_event_idx, load_iter_start,
-                                Int32(TAG_LOAD_ISSUE), Int32(self.load_warp_ids[0]),
+                                Int32(ProfilerTag.LOAD_TMA), Int32(self.load_warp_ids[0]),
                                 prof_max_events, Int32(self.load_warp_ids[0]),
                             )
                             load_iter_idx += 1
@@ -1524,8 +1525,8 @@ class FlashAttentionForwardSm100:
 
             if process_tile:
                 # Compute per-tile event indices for fine-grained profiling
-                prologue_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_MMA_PROLOGUE_OFFSET
-                epilogue_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_MMA_EPILOGUE_OFFSET
+                prologue_event_idx = tile_idx * NUM_TAGS + ProfilerTag.MMA_PROLOGUE
+                epilogue_event_idx = tile_idx * NUM_TAGS + ProfilerTag.MMA_EPILOGUE
                 
                 # ==================== MMA PROLOGUE ====================
                 # Initial Q*K0 -> S0, Q*K1 -> S1
@@ -1553,7 +1554,7 @@ class FlashAttentionForwardSm100:
                 mma_kv_consumer_state.advance()
                 if const_expr(self.prof_enabled):
                     warp_stop(prof_buf, prof_unit_id, prologue_event_idx, prologue_start_ns,
-                              Int32(TAG_MMA_PROLOGUE), Int32(self.mma_warp_id), prof_max_events,
+                              Int32(ProfilerTag.MMA_PROLOGUE), Int32(self.mma_warp_id), prof_max_events,
                               Int32(self.mma_warp_id))
                 # End of prologue
 
@@ -1561,18 +1562,20 @@ class FlashAttentionForwardSm100:
                 # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
-                # Use running event counter for per-iteration events
-                # Start after per-tile events: 100 base + tile_idx * 200 events per tile
-                iter_event_base = Int32(100) + tile_idx * Int32(200)
+                # Use running event counter for per-iteration MMA events
+                iter_event_base = Int32(IterEventBase.MMA) + tile_idx * Int32(ITER_STRIDE_SMALL)
                 iter_event_idx = iter_event_base
                 for i in cutlass.range(block_loop_count, unroll=1):
-                    # Start PV timer for this iteration
-                    pv_iter_start = Int64(0)
+                    # PV timing: separate wait vs gemm (4 slots per iteration)
+                    pv_wait_event_idx = Int32(IterEventBase.MMA_PV) + tile_idx * Int32(ITER_STRIDE_LARGE) + i * Int32(4)
+                    pv_gemm_event_idx = pv_wait_event_idx + Int32(1)
                     qk_iter_start = Int64(0)
+                    
+                    # Start PV WAIT timer (waiting for V and P)
+                    pv_wait_start = Int64(0)
                     if const_expr(self.prof_enabled):
-                        pv_iter_start = warp_start(prof_buf, prof_unit_id, 
-                                                    iter_event_idx,
-                                                    prof_max_events, Int32(self.mma_warp_id))
+                        pv_wait_start = warp_start(prof_buf, prof_unit_id, pv_wait_event_idx,
+                                                   prof_max_events, Int32(self.mma_warp_id))
                     # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                     # 1. wait for V0
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -1585,6 +1588,18 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                             P_full_O_rescaled_phase,
                         )
+                        # Stop wait / Start gemm timing after stage 1 wait
+                        if const_expr(stage == 1):
+                            if const_expr(self.prof_enabled):
+                                warp_stop(prof_buf, prof_unit_id, pv_wait_event_idx, pv_wait_start,
+                                          Int32(ProfilerTag.MMA_PV_WAIT), Int32(self.mma_warp_id), prof_max_events,
+                                          Int32(self.mma_warp_id))
+                    # Start PV GEMM timer (issuing GEMM instructions)
+                    pv_gemm_start = Int64(0)
+                    if const_expr(self.prof_enabled):
+                        pv_gemm_start = warp_start(prof_buf, prof_unit_id, pv_gemm_event_idx,
+                                                   prof_max_events, Int32(self.mma_warp_id))
+                    for stage in cutlass.range_constexpr(2):
                         # 3. gemm PV
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
@@ -1596,11 +1611,11 @@ class FlashAttentionForwardSm100:
                             mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
                             mbar_phase=P_full_O_rescaled_phase,
                         )
-                        # Stop PV / Start QK after stage 1 PV
+                        # Stop PV GEMM / Start QK after stage 1 PV
                         if const_expr(stage == 1):
                             if const_expr(self.prof_enabled):
-                                warp_stop(prof_buf, prof_unit_id, iter_event_idx, pv_iter_start,
-                                          Int32(TAG_MMA_PV), Int32(self.mma_warp_id), prof_max_events,
+                                warp_stop(prof_buf, prof_unit_id, pv_gemm_event_idx, pv_gemm_start,
+                                          Int32(ProfilerTag.MMA_PV_GEMM), Int32(self.mma_warp_id), prof_max_events,
                                           Int32(self.mma_warp_id))
                                 iter_event_idx += 1
                                 qk_iter_start = warp_start(prof_buf, prof_unit_id,
@@ -1628,7 +1643,7 @@ class FlashAttentionForwardSm100:
                     # Stop QK timer after stage 1 QK
                     if const_expr(self.prof_enabled):
                         warp_stop(prof_buf, prof_unit_id, iter_event_idx, qk_iter_start,
-                                  Int32(TAG_MMA_QK), Int32(self.mma_warp_id), prof_max_events,
+                                  Int32(ProfilerTag.MMA_QK), Int32(self.mma_warp_id), prof_max_events,
                                   Int32(self.mma_warp_id))
                         iter_event_idx += 1  # Next event slot
                     # 4. release Ki
@@ -1679,7 +1694,7 @@ class FlashAttentionForwardSm100:
                 mma_kv_consumer_state.advance()
                 if const_expr(self.prof_enabled):
                     warp_stop(prof_buf, prof_unit_id, epilogue_event_idx, epilogue_start_ns,
-                              Int32(TAG_MMA_EPILOGUE), Int32(self.mma_warp_id), prof_max_events,
+                              Int32(ProfilerTag.MMA_EPILOGUE), Int32(self.mma_warp_id), prof_max_events,
                               Int32(self.mma_warp_id))
 
             # Advance to next tile
@@ -1932,8 +1947,8 @@ class FlashAttentionForwardSm100:
             else:
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
                     # Calculate event indices (always, for passing to softmax_step)
-                    sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
-                    tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                    sm_iter_event_idx = Int32(IterEventBase.SOFTMAX) + tile_idx * Int32(ITER_STRIDE_SMALL) + softmax_stage_event_offset + softmax_iter_idx
+                    tmem_iter_event_idx = Int32(IterEventBase.TMEM) + tile_idx * Int32(ITER_STRIDE_LARGE) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
                     # Time individual softmax_step calls
                     if const_expr(self.prof_enabled):
                         sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
@@ -1949,7 +1964,7 @@ class FlashAttentionForwardSm100:
                     )
                     if const_expr(self.prof_enabled):
                         warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
-                                  Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                  Int32(ProfilerTag.SOFTMAX0_COMPUTE if stage == 0 else ProfilerTag.SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
                                   softmax_warp_id)
                         softmax_iter_idx += 1
                     n_block_max -= 1
@@ -1960,8 +1975,8 @@ class FlashAttentionForwardSm100:
                         )
                         for n_tile in cutlass.range(n_block_max - n_block_min_causal_local_mask, unroll=1):
                             n_block = n_block_max - 1 - n_tile
-                            sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
-                            tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                            sm_iter_event_idx = Int32(IterEventBase.SOFTMAX) + tile_idx * Int32(ITER_STRIDE_SMALL) + softmax_stage_event_offset + softmax_iter_idx
+                            tmem_iter_event_idx = Int32(IterEventBase.TMEM) + tile_idx * Int32(ITER_STRIDE_LARGE) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
                             if const_expr(self.prof_enabled):
                                 sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
                                                            prof_max_events, softmax_warp_id)
@@ -1977,7 +1992,7 @@ class FlashAttentionForwardSm100:
                             )
                             if const_expr(self.prof_enabled):
                                 warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
-                                          Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                          Int32(ProfilerTag.SOFTMAX0_COMPUTE if stage == 0 else ProfilerTag.SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
                                           softmax_warp_id)
                                 softmax_iter_idx += 1
                         n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
@@ -1987,8 +2002,8 @@ class FlashAttentionForwardSm100:
                     )
                     for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                         n_block = n_block_max - n_tile - 1
-                        sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
-                        tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                        sm_iter_event_idx = Int32(IterEventBase.SOFTMAX) + tile_idx * Int32(ITER_STRIDE_SMALL) + softmax_stage_event_offset + softmax_iter_idx
+                        tmem_iter_event_idx = Int32(IterEventBase.TMEM) + tile_idx * Int32(ITER_STRIDE_LARGE) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
                         if const_expr(self.prof_enabled):
                             sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
                                                        prof_max_events, softmax_warp_id)
@@ -2005,7 +2020,7 @@ class FlashAttentionForwardSm100:
                             )
                         if const_expr(self.prof_enabled):
                             warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
-                                      Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                      Int32(ProfilerTag.SOFTMAX0_COMPUTE if stage == 0 else ProfilerTag.SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
                                       softmax_warp_id)
                             softmax_iter_idx += 1
                     # Separate iterations with local masking on the left
@@ -2013,8 +2028,8 @@ class FlashAttentionForwardSm100:
                         n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
                         for n_tile in cutlass.range(0, n_block_max - n_block_min, unroll=1):
                             n_block = n_block_max - 1 - n_tile
-                            sm_iter_event_idx = Int32(1000) + tile_idx * Int32(200) + softmax_stage_event_offset + softmax_iter_idx
-                            tmem_iter_event_idx = Int32(4000) + tile_idx * Int32(400) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
+                            sm_iter_event_idx = Int32(IterEventBase.SOFTMAX) + tile_idx * Int32(ITER_STRIDE_SMALL) + softmax_stage_event_offset + softmax_iter_idx
+                            tmem_iter_event_idx = Int32(IterEventBase.TMEM) + tile_idx * Int32(ITER_STRIDE_LARGE) + softmax_stage_event_offset * Int32(2) + softmax_iter_idx * Int32(2)
                             if const_expr(self.prof_enabled):
                                 sm_iter_start = warp_start(prof_buf, prof_unit_id, sm_iter_event_idx,
                                                            prof_max_events, softmax_warp_id)
@@ -2030,7 +2045,7 @@ class FlashAttentionForwardSm100:
                             )
                             if const_expr(self.prof_enabled):
                                 warp_stop(prof_buf, prof_unit_id, sm_iter_event_idx, sm_iter_start,
-                                          Int32(TAG_SOFTMAX0_COMPUTE if stage == 0 else TAG_SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
+                                          Int32(ProfilerTag.SOFTMAX0_COMPUTE if stage == 0 else ProfilerTag.SOFTMAX1_COMPUTE), softmax_warp_id, prof_max_events,
                                           softmax_warp_id)
                                 softmax_iter_idx += 1
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
@@ -2136,9 +2151,18 @@ class FlashAttentionForwardSm100:
         if const_expr(self.prof_enabled):
             warp_stop(
                 prof_buf, prof_unit_id, tmem_event_idx, tmem_load_s_start,
-                Int32(TAG_TMEM_LOAD_S), softmax_warp_id, prof_max_events, softmax_warp_id,
+                Int32(ProfilerTag.TMEM_LOAD_S), softmax_warp_id, prof_max_events, softmax_warp_id,
             )
+        
+        # Time score_mod (if present)
         if cutlass.const_expr(self.score_mod is not None):
+            score_mod_start = Int64(0)
+            score_mod_event_idx = Int32(IterEventBase.SCORE_MOD) + tmem_event_idx
+            if const_expr(self.prof_enabled):
+                score_mod_start = warp_start(
+                    prof_buf, prof_unit_id, score_mod_event_idx,
+                    prof_max_events, softmax_warp_id,
+                )
             self.apply_score_mod(
                 tSrS_t2r,
                 thr_tmem_load,
@@ -2152,9 +2176,27 @@ class FlashAttentionForwardSm100:
                 aux_tensors,
                 fastdiv_mods,
             )
+            if const_expr(self.prof_enabled):
+                warp_stop(
+                    prof_buf, prof_unit_id, score_mod_event_idx, score_mod_start,
+                    Int32(ProfilerTag.SCORE_MOD), softmax_warp_id, prof_max_events, softmax_warp_id,
+                )
 
+        # Time mask_mod (if present)
         if const_expr(mask_fn is not None):
+            mask_mod_start = Int64(0)
+            mask_mod_event_idx = Int32(IterEventBase.MASK_MOD) + tmem_event_idx
+            if const_expr(self.prof_enabled):
+                mask_mod_start = warp_start(
+                    prof_buf, prof_unit_id, mask_mod_event_idx,
+                    prof_max_events, softmax_warp_id,
+                )
             mask_fn(tSrS_t2r, n_block=n_block)
+            if const_expr(self.prof_enabled):
+                warp_stop(
+                    prof_buf, prof_unit_id, mask_mod_event_idx, mask_mod_start,
+                    Int32(ProfilerTag.MASK_MOD), softmax_warp_id, prof_max_events, softmax_warp_id,
+                )
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
@@ -2215,7 +2257,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.prof_enabled):
             warp_stop(
                 prof_buf, prof_unit_id, tmem_event_idx + Int32(1), tmem_store_p_start,
-                Int32(TAG_TMEM_STORE_P), softmax_warp_id, prof_max_events, softmax_warp_id,
+                Int32(ProfilerTag.TMEM_STORE_P), softmax_warp_id, prof_max_events, softmax_warp_id,
             )
 
         cute.arch.mbarrier_wait(
@@ -2318,7 +2360,7 @@ class FlashAttentionForwardSm100:
                     # Time the rescale work (after barrier wait, before arrive)
                     corr_rescale_start = Int64(0)
                     if const_expr(self.prof_enabled):
-                        corr_iter_event_idx = Int32(2000) + tile_idx * Int32(200) + corr_iter_idx
+                        corr_iter_event_idx = Int32(IterEventBase.CORRECTION) + tile_idx * Int32(ITER_STRIDE_SMALL) + corr_iter_idx
                         corr_rescale_start = warp_start(
                             prof_buf, prof_unit_id, corr_iter_event_idx,
                             prof_max_events, Int32(self.correction_warp_ids[0]),
@@ -2351,7 +2393,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.prof_enabled):
                         warp_stop(
                             prof_buf, prof_unit_id, corr_iter_event_idx, corr_rescale_start,
-                            Int32(TAG_CORRECTION_RESCALE), Int32(self.correction_warp_ids[0]),
+                            Int32(ProfilerTag.CORRECTION_RESCALE), Int32(self.correction_warp_ids[0]),
                             prof_max_events, Int32(self.correction_warp_ids[0]),
                         )
                         corr_iter_idx += 1
@@ -2361,7 +2403,7 @@ class FlashAttentionForwardSm100:
                 # End of seqlen_corr_loop_steps
 
                 # Start timing final correction phase
-                corr_final_event_idx = tile_idx * NUM_TILE_SUBTAGS + TAG_CORRECTION_FINAL_OFFSET
+                corr_final_event_idx = tile_idx * NUM_TAGS + ProfilerTag.CORRECTION_FINAL
                 corr_final_start = Int64(0)
                 if const_expr(self.prof_enabled):
                     corr_final_start = warp_start(
@@ -2443,7 +2485,7 @@ class FlashAttentionForwardSm100:
                 if const_expr(self.prof_enabled):
                     warp_stop(
                         prof_buf, prof_unit_id, corr_final_event_idx, corr_final_start,
-                        Int32(TAG_CORRECTION_FINAL), Int32(self.correction_warp_ids[0]),
+                        Int32(ProfilerTag.CORRECTION_FINAL), Int32(self.correction_warp_ids[0]),
                         prof_max_events, Int32(self.correction_warp_ids[0]),
                     )
 
@@ -2752,7 +2794,7 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             epilogue_tile_event_idx = (
-                tile_idx * NUM_TILE_SUBTAGS + TAG_EPILOGUE_TILE_OFFSET
+                tile_idx * NUM_TAGS + ProfilerTag.EPILOGUE_TILE
             )
             epilogue_tile_start_ns = Int64(0)
             # Note: warp_start moved to after barrier waits (inside the if blocks below)
@@ -2863,7 +2905,7 @@ class FlashAttentionForwardSm100:
                     prof_unit_id,
                     epilogue_tile_event_idx,
                     epilogue_tile_start_ns,
-                    Int32(TAG_EPILOGUE_TILE),
+                    Int32(ProfilerTag.EPILOGUE_TILE),
                     Int32(self.epilogue_warp_ids[0]),
                     prof_max_events,
                     Int32(self.epilogue_warp_ids[0]),
