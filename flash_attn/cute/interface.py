@@ -48,6 +48,7 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_tensors,
     get_block_sparse_expected_shapes,
     get_block_sparse_expected_shapes_bwd,
+    get_block_sparse_broadcast_pattern,
 )
 
 @lru_cache(maxsize=None)
@@ -340,6 +341,24 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    block_sparse_broadcast_pattern = None
+    normalized_block_sparse_tensors = None
+    if block_sparse_tensors is not None:
+        if seqlen_q is None:
+            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
+        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
+            batch_size, num_head, seqlen_q, seqlen_k,
+            m_block_size, n_block_size, q_stage,
+        )
+        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=expected_count_shape,
+            expected_index_shape=expected_index_shape,
+        )
+        block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(
+            normalized_block_sparse_tensors
+        )
+
     compile_key = (
         dtype,
         head_dim,
@@ -349,6 +368,7 @@ def _flash_attn_fwd(
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
+        block_sparse_broadcast_pattern,
         len(aux_tensors) if aux_tensors is not None else 0,
         lse is None,
         cu_seqlens_q is None,
@@ -397,19 +417,8 @@ def _flash_attn_fwd(
             lse_tensor = None
 
         sparse_tensors = None
-        if block_sparse_tensors is not None:
-            if seqlen_q is None:
-                raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-            expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
-                batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, q_stage,
-            )
-            compile_time_normalized = normalize_block_sparse_tensors(
-                block_sparse_tensors,
-                expected_count_shape=expected_count_shape,
-                expected_index_shape=expected_index_shape,
-            )
-            sparse_tensors = to_cute_block_sparse_tensors(compile_time_normalized)
+        if normalized_block_sparse_tensors is not None:
+            sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         cute_aux_tensors = None
         if aux_tensors is not None:
@@ -880,6 +889,25 @@ def _flash_attn_bwd(
     if aux_tensors is not None:
         cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
+    # Compute broadcast pattern before compile key to ensure kernels are recompiled
+    # when broadcast patterns change. CuTe's mark_layout_dynamic() keeps stride=0
+    # as static, so different broadcast patterns require different compiled kernels.
+    block_sparse_broadcast_pattern = None
+    normalized_block_sparse_tensors_for_key = None
+    if block_sparse_tensors is not None:
+        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
+            batch_size, num_head, seqlen_q, seqlen_k,
+            m_block_size, n_block_size, subtile_factor,
+        )
+        normalized_block_sparse_tensors_for_key = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=expected_count_shape,
+            expected_index_shape=expected_index_shape,
+        )
+        block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(
+            normalized_block_sparse_tensors_for_key
+        )
+
     if compute_capability == 9:
         compile_key = (
             compute_capability,
@@ -911,6 +939,7 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            block_sparse_broadcast_pattern,
         )
     else:
         compile_key = (
@@ -934,10 +963,11 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            block_sparse_broadcast_pattern,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
-            seqused_k is None,  
+            seqused_k is None,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
