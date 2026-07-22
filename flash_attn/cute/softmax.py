@@ -244,6 +244,8 @@ class Softmax(ParamsBase):
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
     max_offset: cutlass.Constexpr[int] = 0
+    row_max_scaled: cute.Tensor | None = None
+    dyadic_rescale: cutlass.Constexpr[bool] = False
 
     @staticmethod
     def create(
@@ -251,11 +253,13 @@ class SoftmaxSm100(Softmax):
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
         max_offset: cutlass.Constexpr[int] = 0,
+        dyadic_rescale: cutlass.Constexpr[bool] = False,
     ):
         num_rows = 1
         arch = 100
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
+        row_max_scaled = cute.make_rmem_tensor(num_rows, Float32)
         return SoftmaxSm100(
             scale_log2,
             num_rows,
@@ -265,7 +269,14 @@ class SoftmaxSm100(Softmax):
             softmax_scale,
             rescale_threshold=rescale_threshold,
             max_offset=max_offset,
+            row_max_scaled=row_max_scaled,
+            dyadic_rescale=dyadic_rescale,
         )
+
+    def reset(self) -> None:
+        self.row_max.fill(-Float32.inf)
+        self.row_sum.fill(0.0)
+        self.row_max_scaled.fill(-Float32.inf)
 
     @cute.jit
     def compute_row_max_local(self, acc_S_row: cute.TensorSSA, is_first: Boolean) -> Float32:
@@ -282,6 +293,27 @@ class SoftmaxSm100(Softmax):
         row_max_new: Float32,
         is_first: Boolean,
     ) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(self.dyadic_rescale):
+            block_is_empty = row_max_new == -cutlass.Float32.inf
+            row_max_scaled_new = (
+                -Float32.inf if block_is_empty else cute.math.ceil(row_max_new * self.scale_log2)
+            )
+            if cutlass.const_expr(is_first):
+                row_is_empty = block_is_empty
+                acc_scale = 0.0
+            else:
+                row_max_scaled_old = self.row_max_scaled[0]
+                row_is_empty = block_is_empty and row_max_scaled_old == -Float32.inf
+                row_max_scaled_new = cute.arch.fmax(row_max_scaled_new, row_max_scaled_old)
+                acc_scale_ = row_max_scaled_old - row_max_scaled_new
+                acc_scale = cute.math.exp2(acc_scale_)
+                if cutlass.const_expr(self.rescale_threshold > 0.0):
+                    if acc_scale_ >= -self.rescale_threshold:
+                        row_max_scaled_new = row_max_scaled_old
+                        acc_scale = 1.0
+            self.row_max_scaled[0] = -Float32.inf if row_is_empty else row_max_scaled_new
+            self.row_max[0] = -Float32.inf if row_is_empty else row_max_scaled_new / self.scale_log2
+            return Float32.zero if row_is_empty else self.row_max[0], acc_scale
         if cutlass.const_expr(is_first):
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale = 0.0
@@ -304,7 +336,7 @@ class SoftmaxSm100(Softmax):
     ) -> Tuple[Float32, Float32]:
         """Row max already reduced in hardware (SM103 tcgen05.ld.red): skip the
         software fmax tree — the TMEM controller computed the max during the S load."""
-        if cutlass.const_expr(is_first):
+        if cutlass.const_expr(self.dyadic_rescale or is_first):
             row_max_new = hw_row_max
         else:
             row_max_new = cute.arch.fmax(hw_row_max, self.row_max[0])
@@ -312,6 +344,9 @@ class SoftmaxSm100(Softmax):
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(self.dyadic_rescale):
+            row_max_new = self._compute_row_max(acc_S_row)
+            return self.update_row_max_from_local(row_max_new, is_first)
         if cutlass.const_expr(is_first):
             row_max_new = self._compute_row_max(acc_S_row)
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
@@ -346,7 +381,13 @@ class SoftmaxSm100(Softmax):
         row_max: Float32,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
-        row_max_scaled = row_max * self.scale_log2
+        if cutlass.const_expr(self.dyadic_rescale):
+            stored_row_max_scaled = self.row_max_scaled[0]
+            row_max_scaled = (
+                stored_row_max_scaled if stored_row_max_scaled != -Float32.inf else Float32.zero
+            )
+        else:
+            row_max_scaled = row_max * self.scale_log2
         max_offset = Float32(self.max_offset)
         bias = max_offset - row_max_scaled
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):

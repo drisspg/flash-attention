@@ -69,6 +69,7 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
+        dyadic_reconstruction: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -123,6 +124,7 @@ class FlashAttentionBackwardSm100:
         self.has_aux_tensors = has_aux_tensors
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
+        self.dyadic_reconstruction = dyadic_reconstruction
         assert self.kv_subtile_factor == 1 or self.kv_subtile_factor % self.cta_group_size == 0
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
@@ -3167,6 +3169,14 @@ class FlashAttentionBackwardSm100:
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                use_dyadic_reconstruction = const_expr(
+                    self.dyadic_reconstruction and self.q_dtype.width == 16
+                )
+                tSrP_rounded_pair = (
+                    cute.make_rmem_tensor(2, self.q_dtype)
+                    if const_expr(use_dyadic_reconstruction)
+                    else None
+                )
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -3184,14 +3194,45 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrLSE, offset=2 * v),
                                 utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
                             )
+                        if const_expr(use_dyadic_reconstruction):
+                            lse_anchor_pair = (
+                                lse_pair[0]
+                                if lse_pair[0] == lse_pair[0]
+                                and lse_pair[0] != -Float32.inf
+                                and lse_pair[0] != Float32.inf
+                                else Float32.zero,
+                                lse_pair[1]
+                                if lse_pair[1] == lse_pair[1]
+                                and lse_pair[1] != -Float32.inf
+                                and lse_pair[1] != Float32.inf
+                                else Float32.zero,
+                            )
+                            anchor_pair = (
+                                cute.math.floor(lse_anchor_pair[0]),
+                                cute.math.floor(lse_anchor_pair[1]),
+                            )
+                        else:
+                            anchor_pair = lse_pair
                         tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
                             ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
                             (softmax_scale_log2, softmax_scale_log2),
-                            (-lse_pair[0], -lse_pair[1]),
+                            (-anchor_pair[0], -anchor_pair[1]),
                         )
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
-                    utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
+                        if const_expr(use_dyadic_reconstruction):
+                            tSrP_rounded_pair[0] = tSrS_cur[2 * v].to(self.q_dtype)
+                            tSrP_rounded_pair[1] = tSrS_cur[2 * v + 1].to(self.q_dtype)
+                            normalizer_pair = (
+                                cute.math.exp2(anchor_pair[0] - lse_pair[0]),
+                                cute.math.exp2(anchor_pair[1] - lse_pair[1]),
+                            )
+                            tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = (
+                                Float32(tSrP_rounded_pair[0]) * normalizer_pair[0],
+                                Float32(tSrP_rounded_pair[1]) * normalizer_pair[1],
+                            )
+                    tSrP_cur = tSrP_r2t[None, stage, 0, 0]
+                    utils.cvt_f16(tSrS_cur, tSrP_cur)
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()
                         # Without this barrier, we could have 1 warp writing to P in tmem while

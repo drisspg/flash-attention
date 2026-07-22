@@ -110,8 +110,8 @@ def test_flash_attn_bf16_row_sum_matches_pv():
 
 @pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_flash_attn_lowp_pv_row_sum_preserves_lse(dtype):
-    """Keep LSE tied to the FP32 exponential mass used by backward."""
+def test_flash_attn_dyadic_lowp_lse(dtype):
+    """Save the dyadic lowp-mass normalizer used by the output."""
     torch.manual_seed(0)
     q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=dtype)
     k = torch.zeros(1, 8192, 1, 128, device="cuda", dtype=dtype)
@@ -122,7 +122,125 @@ def test_flash_attn_lowp_pv_row_sum_preserves_lse(dtype):
 
     _, lse = flash_attn_func(q, k, v, softmax_scale=1.0, return_lse=True)
 
-    assert torch.equal(lse[0, 0, 0], torch.logsumexp(logits.float(), dim=0))
+    log2_e = math.log2(math.e)
+    scores_log2 = logits.float() * log2_e
+    anchor = torch.ceil(scores_log2.max())
+    p_lowp = torch.exp2(scores_log2 - anchor).to(dtype).float()
+    expected_lse = (anchor + torch.log2(p_lowp.sum())) * math.log(2.0)
+
+    torch.testing.assert_close(lse[0, 0, 0], expected_lse, atol=1e-5, rtol=0.0)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_dyadic_forward_dv_probability_match(dtype):
+    """Compare forward probabilities with the weights reconstructed for dV."""
+    torch.manual_seed(0)
+    q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.zeros(1, 128, 1, 128, device="cuda", dtype=dtype, requires_grad=True)
+    q.data[..., 0] = 1
+    k.data[0, :, 0, 0] = torch.randn(128, device="cuda", dtype=dtype)
+    v = torch.eye(128, device="cuda", dtype=dtype).reshape(1, 128, 1, 128).requires_grad_()
+
+    out, _ = flash_attn_func(q, k, v, softmax_scale=1.0, num_splits=1)
+    dout = torch.zeros_like(out)
+    dout[..., 0] = 1
+    dv = torch.autograd.grad(out, v, dout)[0]
+
+    p_out = out[0, 0, 0].float()
+    p_dv = dv[0, :, 0, 0].float()
+    atol = 1e-5 if dtype == torch.float16 else 0.0
+    torch.testing.assert_close(p_dv, p_out, atol=atol, rtol=0.0)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+def test_flash_attn_dyadic_varlen_matches_independent_sequences():
+    """Prevent padded query rows from mixing adjacent packed sequences."""
+    torch.manual_seed(0)
+    cu_seqlens_q = torch.tensor([0, 100, 200], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 128, 256], device="cuda", dtype=torch.int32)
+    q = torch.randn(200, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(256, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(256, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    dout = torch.randn_like(q)
+
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=100,
+        max_seqlen_k=128,
+        return_lse=True,
+    )
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+
+    q_ref = q.detach().clone().requires_grad_()
+    k_ref = k.detach().clone().requires_grad_()
+    v_ref = v.detach().clone().requires_grad_()
+    outputs_ref = []
+    lse_ref = []
+    for batch in range(2):
+        q_slice = q_ref[batch * 100 : (batch + 1) * 100].unsqueeze(0)
+        k_slice = k_ref[batch * 128 : (batch + 1) * 128].unsqueeze(0)
+        v_slice = v_ref[batch * 128 : (batch + 1) * 128].unsqueeze(0)
+        out_slice, lse_slice = flash_attn_func(q_slice, k_slice, v_slice, return_lse=True)
+        outputs_ref.append(out_slice.squeeze(0))
+        lse_ref.append(lse_slice.squeeze(0))
+    out_ref = torch.cat(outputs_ref)
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout)
+
+    assert torch.equal(out, out_ref)
+    assert torch.equal(lse, torch.cat(lse_ref, dim=-1))
+    for actual, expected in zip(grads, grads_ref):
+        assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+def test_flash_attn_dyadic_auto_single_split_matches_explicit_single_split():
+    """Use the resolved SplitKV decision for backward reconstruction."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(1, 128, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    dout = torch.randn_like(q)
+    results = []
+    for num_splits in (0, 1):
+        out, lse = flash_attn_func(q, k, v, num_splits=num_splits, return_lse=True)
+        grads = torch.autograd.grad(out, (q, k, v), dout, retain_graph=True)
+        results.append((out, lse, *grads))
+
+    for automatic, explicit in zip(*results):
+        assert torch.equal(automatic, explicit)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+def test_flash_attn_dyadic_preserves_fp8_lse():
+    """Keep the existing FP8 lowp-row-sum and FP32-mass LSE path."""
+    q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=torch.float8_e4m3fn)
+    k = torch.zeros(1, 256, 1, 128, device="cuda", dtype=torch.float8_e4m3fn)
+    v = torch.ones_like(k)
+
+    out, lse = flash_attn_func(q, k, v, return_lse=True)
+
+    assert torch.equal(out, torch.ones_like(out))
+    torch.testing.assert_close(lse[0, 0, 0], torch.tensor(math.log(256), device="cuda"))
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+def test_flash_attn_dyadic_local_empty_block_preserves_anchor():
+    """Keep the running anchor when a later local-attention block is empty."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 512, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+
+    out, lse = flash_attn_func(q, k, v, window_size=(8, 0), return_lse=True)
+    grads = torch.autograd.grad(out, (q, k, v), torch.randn_like(out))
+
+    for tensor in (out, lse, *grads):
+        assert torch.isfinite(tensor).all()
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])

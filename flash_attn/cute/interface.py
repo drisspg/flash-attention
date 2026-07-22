@@ -334,7 +334,7 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], bool]:
     """Forward pass for FlashAttention.
 
     Args:
@@ -1112,7 +1112,7 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
-    return out, lse, p, row_max
+    return out, lse, p, row_max, is_split_kv
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
@@ -1347,6 +1347,7 @@ def _flash_attn_bwd(
     aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    dyadic_reconstruction: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
@@ -1807,6 +1808,7 @@ def _flash_attn_bwd(
             aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            dyadic_reconstruction,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1944,6 +1946,7 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
+                    dyadic_reconstruction=dyadic_reconstruction,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -2508,7 +2511,7 @@ class FlashAttnFunc(torch.autograd.Function):
             # by setting q, k to None
             qv = q if qv is None else qv
             q = k = None
-        out, lse, p, row_max = _flash_attn_fwd(
+        out, lse, p, row_max, is_split_kv = _flash_attn_fwd(
             q,
             k,
             v,
@@ -2542,6 +2545,14 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
+        ctx.dyadic_reconstruction = (
+            _get_device_arch() // 10 in [10, 11]
+            and q is not None
+            and q.element_size() == 2
+            and not is_split_kv
+            and learnable_sink is None
+            and block_sparse_tensors is None
+        )
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -2593,6 +2604,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 aux_scalars=ctx.aux_scalars,
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
+                dyadic_reconstruction=ctx.dyadic_reconstruction,
             )
             return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
 
@@ -2638,7 +2650,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             # by setting q, k to None
             qv = q if qv is None else qv
             q = k = None
-        out, lse, p, row_max = _flash_attn_fwd(
+        out, lse, p, row_max, is_split_kv = _flash_attn_fwd(
             q,
             k,
             v,
@@ -2697,6 +2709,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.score_mod_bwd = score_mod_bwd
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
+        ctx.dyadic_reconstruction = (
+            _get_device_arch() // 10 in [10, 11]
+            and q is not None
+            and q.element_size() == 2
+            and not is_split_kv
+            and learnable_sink is None
+            and block_sparse_tensors is None
+        )
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -2760,6 +2780,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 aux_scalars=ctx.aux_scalars,
                 mask_mod=ctx.mask_mod,
                 dlse=dlse,
+                dyadic_reconstruction=ctx.dyadic_reconstruction,
             )
             return dq, dk, dv, *((None,) * 31)
 

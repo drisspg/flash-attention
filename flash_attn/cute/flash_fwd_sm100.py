@@ -2047,20 +2047,25 @@ class FlashAttentionForwardSm100:
                 4.0 if const_expr(self.q_dtype.width == 8) else
                 0.0
             )
+            use_lowp_row_sum = const_expr(
+                self.q_dtype.width != Float32.width
+                and not self.is_split_kv
+                and learnable_sink is None
+                and not self.use_block_sparsity
+            )
+            use_dyadic_rescale = const_expr(
+                self.q_dtype.width == 16 and use_lowp_row_sum
+            )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
                 rescale_threshold=rescale_threshold,
                 softmax_scale=softmax_scale_eff,
                 max_offset=max_offset,
+                dyadic_rescale=use_dyadic_rescale,
             )
             softmax.reset()
             l_i_lowp = None
-            if const_expr(
-                self.q_dtype.width != Float32.width
-                and not self.is_split_kv
-                and learnable_sink is None
-                and not self.use_block_sparsity
-            ):
+            if const_expr(use_lowp_row_sum):
                 l_i_lowp = cute.make_rmem_tensor(1, Float32)
                 l_i_lowp.fill(0.0)
 
@@ -2227,7 +2232,25 @@ class FlashAttentionForwardSm100:
                         l_i_lowp[0] if const_expr(l_i_lowp is not None) else l_i_fp32
                     )
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        if const_expr(l_i_lowp is not None):
+                        if const_expr(use_dyadic_rescale):
+                            l_i_out = l_i_lowp[0]
+                            l_i_out_is_zero_or_nan = l_i_out == 0.0 or l_i_out != l_i_out
+                            LN2 = math.log(2.0)
+                            sScale[
+                                tidx
+                                + stage * self.m_block_size
+                                + self.q_stage * self.m_block_size
+                            ] = (
+                                (
+                                    softmax.row_max_scaled[0]
+                                    + cute.math.log2(l_i_out, fastmath=True)
+                                    - max_offset
+                                )
+                                * LN2
+                                if not l_i_out_is_zero_or_nan
+                                else -Float32.inf
+                            )
+                        elif const_expr(l_i_lowp is not None):
                             l_i_fp32_is_zero_or_nan = l_i_fp32 == 0.0 or l_i_fp32 != l_i_fp32
                             LN2 = math.log(2.0)
                             sScale[
