@@ -1,0 +1,109 @@
+{
+  "stack_commit": "469c0d8d2301796b4754a3d2b60b2c6d64ece3b9",
+  "campaign": "benchmarks/configs/fwd_config_sm103.yaml",
+  "campaign_sha256": "51001f797074ab31db76bdb388d5c33dac7492898671e29750a079622076b028",
+  "hardware": {
+    "gpu": "NVIDIA GB300",
+    "compute_capability": "10.3",
+    "sms": 152
+  },
+  "timing_contract": "fixed-pointer CUDA-graph replay; preallocated outputs/workspaces; cyclic arms; 20 untimed 4096x4096 GEMMs before each arm",
+  "policies": [
+    {
+      "experiment": "long_k_d64_nonpersistent",
+      "cells": 96,
+      "phases": {
+        "boundary": 48,
+        "holdout": 48
+      },
+      "geomean_speedup": 1.0584631474212671,
+      "geomean_ci95": [
+        1.057673516141985,
+        1.0592533682185317
+      ],
+      "time_weighted_speedup": 1.0416891683028633,
+      "minimum_speedup": 0.9994880178046645,
+      "maximum_speedup": 1.1056984764038025,
+      "wins_neutral_losses": [
+        94,
+        2,
+        0
+      ],
+      "minimum_holdout_speedup": 1.0089786632823978,
+      "paired_intervals_wholly_below_one": 0
+    },
+    {
+      "experiment": "balanced_varlen_mha_clc",
+      "cells": 84,
+      "phases": {
+        "boundary": 48,
+        "holdout": 36
+      },
+      "geomean_speedup": 1.1436104222940524,
+      "geomean_ci95": [
+        1.1427113659113368,
+        1.1445101860315763
+      ],
+      "time_weighted_speedup": 1.1029842075390006,
+      "minimum_speedup": 1.0099855031756617,
+      "maximum_speedup": 1.3732194010945693,
+      "wins_neutral_losses": [
+        83,
+        1,
+        0
+      ],
+      "minimum_holdout_speedup": 1.0099855031756617,
+      "paired_intervals_wholly_below_one": 0
+    },
+    {
+      "experiment": "high_head_varlen_clc",
+      "cells": 50,
+      "phases": {
+        "boundary": 44,
+        "holdout": 6
+      },
+      "geomean_speedup": 1.191590079385935,
+      "geomean_ci95": [
+        1.190222941034193,
+        1.1929587880882464
+      ],
+      "time_weighted_speedup": 1.1237365265815222,
+      "minimum_speedup": 1.0033512699478548,
+      "maximum_speedup": 1.4206876314255303,
+      "wins_neutral_losses": [
+        49,
+        1,
+        0
+      ],
+      "minimum_holdout_speedup": 1.0218206689630083,
+      "paired_intervals_wholly_below_one": 0
+    },
+    {
+      "experiment": "dense_short_k_clc",
+      "cells": 67,
+      "phases": {
+        "boundary": 62,
+        "holdout": 5
+      },
+      "geomean_speedup": 1.118470985338464,
+      "geomean_ci95": [
+        1.1176292013382338,
+        1.1193134033596217
+      ],
+      "time_weighted_speedup": 1.127654354198405,
+      "minimum_speedup": 1.0054705013246383,
+      "maximum_speedup": 1.357342189477732,
+      "wins_neutral_losses": [
+        65,
+        2,
+        0
+      ],
+      "minimum_holdout_speedup": 1.093465048953704,
+      "paired_intervals_wholly_below_one": 0
+    }
+  ],
+  "sources": {
+    "initial_exact_superset": "agent_space/gb300_fwd_config_final_exact/results.json",
+    "narrowed_dense": "agent_space/gb300_fwd_config_final_dense_narrow/results.json"
+  }
+}
