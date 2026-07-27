@@ -1,0 +1,9 @@
+$ jq structural checks
+complete campaign: 144/144, compile 22, correctness all pass
+final confirmation: 24/24, fake compile 12, correctness all pass, 217 samples/arm/cell
+
+$ git state
+## fa4-b200-tuning...origin/fa4-b200-tuning
+HEAD=0348c1b7dcb3c512c09a98a59149ee9dab6027b7
+f16ee60a6a7dbde3c7f0498b16b4558d1579c331	refs/heads/drisspg/stack/56
+0348c1b7dcb3c512c09a98a59149ee9dab6027b7	refs/heads/fa4-b200-tuning

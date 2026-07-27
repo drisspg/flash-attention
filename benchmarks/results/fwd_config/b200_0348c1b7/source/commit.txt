@@ -1,0 +1,21 @@
+commit 0348c1b7dcb3c512c09a98a59149ee9dab6027b7
+Author:     drisspg <drisspguessous@gmail.com>
+AuthorDate: Mon Jul 27 14:04:51 2026 -0700
+Commit:     drisspg <drisspguessous@gmail.com>
+CommitDate: Mon Jul 27 14:04:51 2026 -0700
+
+    [CuTe] Tune B200 forward scheduling
+    
+    B200 BF16 output-only measurements:
+    
+    D64 direct O: 60 cells | geomean 1.204x [1.203, 1.206] | weighted 1.191x | min 1.171x | max 1.264x | W/N/L 60/0/0
+    D128 1CTA: 72 cells | geomean 1.206x [1.203, 1.208] | weighted 1.158x | min 1.105x | max 1.560x | W/N/L 72/0/0
+    
+    Keep causal, LSE/training, FP16, SM103, and unmeasured features on existing configs.
+
+ benchmarks/configs/fwd_config_b200.yaml | 244 ++++++++++++++++++++++++++++++++
+ flash_attn/cute/config.py               |  25 ++++
+ flash_attn/cute/pyproject.toml          |   1 +
+ tests/cute/test_flash_attn.py           |  40 ++++++
+ tests/cute/test_fwd_config.py           | 133 ++++++++++++++++-
+ 5 files changed, 441 insertions(+), 2 deletions(-)

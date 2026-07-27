@@ -1,0 +1,179 @@
+[1/12] compiled d128_1cta_long_noncausal_mha/candidate
+[2/12] compiled d64_direct_scope_controls/candidate
+[3/12] compiled d64_direct_scope_controls/candidate
+[4/12] compiled d128_1cta_scope_controls/candidate
+[5/12] compiled d64_direct_long_noncausal_mha/candidate
+[6/12] compiled d128_1cta_scope_controls/candidate
+[7/12] compiled d64_direct_long_noncausal_mha/baseline
+[8/12] compiled d64_direct_scope_controls/baseline
+[9/12] compiled d64_direct_scope_controls/baseline
+[10/12] compiled d128_1cta_scope_controls/baseline
+[11/12] compiled d128_1cta_scope_controls/baseline
+[12/12] compiled d128_1cta_long_noncausal_mha/baseline
+correctness passed: d64_direct_long_noncausal_mha
+correctness passed: d64_direct_scope_controls
+correctness passed: d128_1cta_long_noncausal_mha
+correctness passed: d128_1cta_scope_controls
+[1/24] d64_direct_long_noncausal_mha__q32768_k16384_b1_c0_s1__h16kv16d64v64: old/config=None=1.2170x paired=1.2160x [1.2078, 1.2243]
+[2/24] d64_direct_long_noncausal_mha__q4096_k24576_b4_c0_s1__h32kv32d64v64: old/config=None=1.1732x paired=1.1763x [1.1693, 1.1833]
+[3/24] d64_direct_scope_controls__q16384_k8192_b2_c0_s1__h16kv4d64v64: old/config=None=1.2208x paired=1.2291x [1.2096, 1.2490]
+[4/24] d64_direct_scope_controls__q8193_k16385_b3_c0_s1__h24kv3d64v64: old/config=None=1.2051x paired=1.2063x [1.2021, 1.2106]
+[5/24] d64_direct_long_noncausal_mha__q32767_k9216_b1_c0_s1__h16kv16d64v64: old/config=None=1.2069x paired=1.2105x [1.1897, 1.2316]
+[6/24] d64_direct_long_noncausal_mha__q24577_k8193_b2_c0_s1__h16kv16d64v64: old/config=None=1.1878x paired=1.1841x [1.1723, 1.1961]
+[7/24] d64_direct_scope_controls__q511_k8192_b1_c0_s1__h32kv32d64v64: old/config=None=1.2613x paired=1.2479x [1.2251, 1.2711]
+[8/24] d64_direct_scope_controls__q257_k2049_b4_c0_s1__h8kv8d64v64: old/config=None=1.2151x paired=1.2137x [1.2091, 1.2183]
+[9/24] d64_direct_long_noncausal_mha__q8193_k12289_b3_c0_s1__h24kv24d64v64: old/config=None=1.1841x paired=1.1853x [1.1767, 1.1940]
+[10/24] d64_direct_long_noncausal_mha__q9363_k24577_b7_c0_s1__h8kv8d64v64: old/config=None=1.1750x paired=1.1769x [1.1728, 1.1809]
+[11/24] d64_direct_scope_controls__q769_k3073_b1_c0_s1__h24kv24d64v64: old/config=None=1.2375x paired=1.2471x [1.2123, 1.2829]
+[12/24] d64_direct_scope_controls__q6657_k10241_b5_c0_s1__h16kv2d64v64: old/config=None=1.2020x paired=1.2046x [1.1991, 1.2100]
+[13/24] d128_1cta_long_noncausal_mha__q32768_k16384_b1_c0_s1__h16kv16d128v128: old/config=None=1.1498x paired=1.1480x [1.1391, 1.1568]
+[14/24] d128_1cta_long_noncausal_mha__q4096_k24576_b4_c0_s1__h32kv32d128v128: old/config=None=1.1729x paired=1.1728x [1.1635, 1.1823]
+[15/24] d128_1cta_scope_controls__q16384_k8192_b2_c0_s1__h16kv4d128v128: old/config=None=1.1268x paired=1.1235x [1.1114, 1.1356]
+[16/24] d128_1cta_scope_controls__q8193_k16385_b3_c0_s1__h24kv3d128v128: old/config=None=1.1120x paired=1.1075x [1.0873, 1.1281]
+[17/24] d128_1cta_long_noncausal_mha__q32767_k9216_b1_c0_s1__h16kv16d128v128: old/config=None=1.1567x paired=1.1628x [1.1523, 1.1734]
+[18/24] d128_1cta_long_noncausal_mha__q24577_k8193_b2_c0_s1__h16kv16d128v128: old/config=None=1.1683x paired=1.1705x [1.1650, 1.1761]
+[19/24] d128_1cta_scope_controls__q511_k8192_b1_c0_s1__h32kv32d128v128: old/config=None=1.5003x paired=1.5002x [1.4935, 1.5069]
+[20/24] d128_1cta_scope_controls__q511_k2048_b2_c0_s1__h16kv16d128v128: old/config=None=1.2733x paired=1.2730x [1.2678, 1.2783]
+[21/24] d128_1cta_long_noncausal_mha__q8193_k12289_b3_c0_s1__h24kv24d128v128: old/config=None=1.2231x paired=1.2260x [1.2048, 1.2476]
+[22/24] d128_1cta_long_noncausal_mha__q9363_k24577_b7_c0_s1__h8kv8d128v128: old/config=None=1.1786x paired=1.1784x [1.1690, 1.1880]
+[23/24] d128_1cta_scope_controls__q769_k3073_b1_c0_s1__h24kv24d128v128: old/config=None=1.3248x paired=1.3833x [1.2635, 1.5145]
+[24/24] d128_1cta_scope_controls__q6657_k10241_b5_c0_s1__h16kv2d128v128: old/config=None=1.1319x paired=1.1378x [1.1254, 1.1503]
+{
+  "d64_direct_output": {
+    "all": {
+      "cells": 12,
+      "geomean_paired_round_speedup": 1.2079160677842036,
+      "geomean_paired_round_ci95": [
+        1.2034322084808136,
+        1.2124166334663249
+      ],
+      "time_weighted_speedup": 1.1928081055656092,
+      "minimum_speedup": 1.1732058271575405,
+      "maximum_speedup": 1.2612677999407216,
+      "wins_neutral_losses": [
+        12,
+        0,
+        0
+      ]
+    },
+    "by_phase": {
+      "discovery": {
+        "cells": 4,
+        "geomean_paired_round_speedup": 1.2067784937108157,
+        "geomean_paired_round_ci95": [
+          1.2011400551786056,
+          1.2124434004212739
+        ],
+        "time_weighted_speedup": 1.198070280634126,
+        "minimum_speedup": 1.1732058271575405,
+        "maximum_speedup": 1.2207739805094084,
+        "wins_neutral_losses": [
+          4,
+          0,
+          0
+        ]
+      },
+      "boundary": {
+        "cells": 4,
+        "geomean_paired_round_speedup": 1.2138362879220819,
+        "geomean_paired_round_ci95": [
+          1.2055375778007063,
+          1.222192124914446
+        ],
+        "time_weighted_speedup": 1.197701251220819,
+        "minimum_speedup": 1.1878262873249517,
+        "maximum_speedup": 1.2612677999407216,
+        "wins_neutral_losses": [
+          4,
+          0,
+          0
+        ]
+      },
+      "holdout": {
+        "cells": 4,
+        "geomean_paired_round_speedup": 1.203157815134603,
+        "geomean_paired_round_ci95": [
+          1.1942293364523442,
+          1.2121530462647763
+        ],
+        "time_weighted_speedup": 1.1835408593144285,
+        "minimum_speedup": 1.1749873906177386,
+        "maximum_speedup": 1.2374501501247452,
+        "wins_neutral_losses": [
+          4,
+          0,
+          0
+        ]
+      }
+    }
+  },
+  "d128_1cta": {
+    "all": {
+      "cells": 12,
+      "geomean_paired_round_speedup": 1.2105309764423269,
+      "geomean_paired_round_ci95": [
+        1.2007830206050143,
+        1.2203580661792495
+      ],
+      "time_weighted_speedup": 1.1622201510558612,
+      "minimum_speedup": 1.1120067968428207,
+      "maximum_speedup": 1.5003015002269326,
+      "wins_neutral_losses": [
+        12,
+        0,
+        0
+      ]
+    },
+    "by_phase": {
+      "discovery": {
+        "cells": 4,
+        "geomean_paired_round_speedup": 1.1376652421371871,
+        "geomean_paired_round_ci95": [
+          1.1308424473940522,
+          1.1445292013486477
+        ],
+        "time_weighted_speedup": 1.1447396119212971,
+        "minimum_speedup": 1.1120067968428207,
+        "maximum_speedup": 1.1728887768787322,
+        "wins_neutral_losses": [
+          4,
+          0,
+          0
+        ]
+      },
+      "boundary": {
+        "cells": 4,
+        "geomean_paired_round_speedup": 1.2697436368709523,
+        "geomean_paired_round_ci95": [
+          1.2659692019019908,
+          1.273529325162122
+        ],
+        "time_weighted_speedup": 1.1717034948216478,
+        "minimum_speedup": 1.156709571112927,
+        "maximum_speedup": 1.5003015002269326,
+        "wins_neutral_losses": [
+          4,
+          0,
+          0
+        ]
+      },
+      "holdout": {
+        "cells": 4,
+        "geomean_paired_round_speedup": 1.2279966627753467,
+        "geomean_paired_round_ci95": [
+          1.1997047520219661,
+          1.2569557645294531
+        ],
+        "time_weighted_speedup": 1.1818902606286648,
+        "minimum_speedup": 1.1319338045366398,
+        "maximum_speedup": 1.3247927881803443,
+        "wins_neutral_losses": [
+          4,
+          0,
+          0
+        ]
+      }
+    }
+  }
+}
+results=/home/drisspg/meta/flash-attention-b200-perf-tuning/agent_space/b200_fwd_config/review_artifacts/final_7x31_baseline_vs_auto.json

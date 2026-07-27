@@ -1,0 +1,39 @@
+gpu-run: waiting for GPU 0 (GPU-a8c7d79e-7e45-2c4c-0ddb-efebb20754a9)
+gpu-run: acquired GPU 0 (GPU-a8c7d79e-7e45-2c4c-0ddb-efebb20754a9)
+..                                                                       [100%]
+=============================== warnings summary ===============================
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+  /home/drisspg/meta/flash-attention-b200-perf-tuning/flash_attn/cute/flash_fwd_sm100.py:484: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    q_major_mode = tcgen05.OperandMajorMode.K
+
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+  /home/drisspg/meta/flash-attention-b200-perf-tuning/flash_attn/cute/flash_fwd_sm100.py:485: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    k_major_mode = tcgen05.OperandMajorMode.K
+
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+  /home/drisspg/meta/flash-attention-b200-perf-tuning/flash_attn/cute/flash_fwd_sm100.py:486: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    v_major_mode = tcgen05.OperandMajorMode.MN
+
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+  /home/drisspg/meta/flash-attention-b200-perf-tuning/flash_attn/cute/flash_fwd_sm100.py:490: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+    p_major_mode = tcgen05.OperandMajorMode.K
+
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+  /home/drisspg/.venvs/fa4-b200-tuning/lib/python3.12/site-packages/nvidia_cutlass_dsl/python_packages/cutlass/_mlir_helpers/op.py:139: DeprecationWarning: make_trivial_tiled_mma with ab_dtype is deprecated, use the overload with separate a_dtype and b_dtype instead
+    res_or_list = opFunc(*args, **kwargs, loc=loc)
+
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[64]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+cute/test_flash_attn.py::test_flash_attn_b200_bf16_output_policy_default_matches_reference[128]
+  <string>:11: DeprecationWarning: tcgen05.OperandMajorMode is deprecated, use cute.nvgpu.OperandMajorMode instead
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 passed, 16 warnings in 22.22s

@@ -1,0 +1,8 @@
+$ /home/drisspg/.venvs/fa4-b200-tuning/bin/ruff check flash_attn/cute/config.py tests/cute/test_fwd_config.py benchmarks/fwd_config_bench.py
+All checks passed!
+
+$ git diff --check
+git diff --check: passed
+
+$ git status --short --branch
+## fa4-b200-tuning...origin/fa4-b200-tuning

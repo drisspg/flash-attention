@@ -1,0 +1,9 @@
+timestamp_utc=2026-07-27T22:07:17Z
+2026/07/27 15:07:17.846, 0, NVIDIA GB200, GPU-a8c7d79e-7e45-2c4c-0ddb-efebb20754a9, P0, 120, 2062, 201.01, 1120.00, 43, 3, 580.126.20
+torch=2.14.0.dev20260708+cu132
+cuda=13.2
+gpu=NVIDIA GB200
+compute_capability=10.0
+sms=152
+cutlass_dsl=4.6.0.dev0
+cutlass_dsl_libs_cu13=4.6.0.dev0

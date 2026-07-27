@@ -1,0 +1,519 @@
+From 0348c1b7dcb3c512c09a98a59149ee9dab6027b7 Mon Sep 17 00:00:00 2001
+From: drisspg <drisspguessous@gmail.com>
+Date: Mon, 27 Jul 2026 14:04:51 -0700
+Subject: [PATCH] [CuTe] Tune B200 forward scheduling
+
+B200 BF16 output-only measurements:
+
+D64 direct O: 60 cells | geomean 1.204x [1.203, 1.206] | weighted 1.191x | min 1.171x | max 1.264x | W/N/L 60/0/0
+D128 1CTA: 72 cells | geomean 1.206x [1.203, 1.208] | weighted 1.158x | min 1.105x | max 1.560x | W/N/L 72/0/0
+
+Keep causal, LSE/training, FP16, SM103, and unmeasured features on existing configs.
+
+diff --git a/benchmarks/configs/fwd_config_b200.yaml b/benchmarks/configs/fwd_config_b200.yaml
+new file mode 100644
+index 0000000..f3e4024
+--- /dev/null
++++ b/benchmarks/configs/fwd_config_b200.yaml
+@@ -0,0 +1,244 @@
++# Independent B200/SM100 BF16 policy measurements.
++#
++# The two *_long_noncausal_mha experiments are promotion strata: each has 24
++# frozen discovery/boundary cells and 12 independent holdouts. The *_controls
++# experiments measure exclusions and selector boundaries without mixing them
++# into a proposed production rule's aggregate. D64 changes only the output
++# epilogue; D128 changes only CTA topology.
++settings:
++  dtype: bfloat16
++  seed: 0
++  workers: 16
++  rounds: 7
++  iters_per_round: 31
++  warmup_iters: 10
++  clock_warmup_iters: 20
++
++experiments:
++  - name: d64_direct_long_noncausal_mha
++    baseline: {use_tma_o: true}
++    candidate: {use_tma_o: false}
++    correctness:
++      mode: dense
++      q_heads: 8
++      kv_heads: 8
++      head_dim: 64
++      batch: 1
++      seqlen_q: 65
++      seqlen_k: 129
++      causal: false
++    case_table:
++      mode: dense
++      causal: false
++      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k]
++      rows:
++        # Discovery: long-context interiors across batch, heads, and Q/K aspect ratios.
++        - [discovery, 16, 16, 64, 1, 32768, 16384]
++        - [discovery, 16, 16, 64, 1, 32768, 32768]
++        - [discovery, 32, 32, 64, 1, 16384, 8192]
++        - [discovery, 32, 32, 64, 1, 16384, 24576]
++        - [discovery, 16, 16, 64, 2, 16384, 12288]
++        - [discovery, 16, 16, 64, 2, 16384, 32768]
++        - [discovery, 32, 32, 64, 2, 8192, 8192]
++        - [discovery, 32, 32, 64, 2, 8192, 24576]
++        - [discovery, 16, 16, 64, 4, 8192, 16384]
++        - [discovery, 16, 16, 64, 4, 8192, 32768]
++        - [discovery, 32, 32, 64, 4, 4096, 8192]
++        - [discovery, 32, 32, 64, 4, 4096, 24576]
++        # Boundary: total-Q*heads around 524288 and K around 64 128-wide tiles.
++        - [boundary, 16, 16, 64, 1, 32767, 9216]
++        - [boundary, 16, 16, 64, 1, 32768, 9216]
++        - [boundary, 16, 16, 64, 1, 32769, 9216]
++        - [boundary, 32, 32, 64, 1, 16383, 12288]
++        - [boundary, 32, 32, 64, 1, 16384, 12288]
++        - [boundary, 32, 32, 64, 1, 16385, 12288]
++        - [boundary, 32, 32, 64, 2, 8191, 16384]
++        - [boundary, 32, 32, 64, 2, 8192, 16384]
++        - [boundary, 32, 32, 64, 2, 8193, 16384]
++        - [boundary, 16, 16, 64, 2, 24577, 8191]
++        - [boundary, 16, 16, 64, 2, 24577, 8192]
++        - [boundary, 16, 16, 64, 2, 24577, 8193]
++        # Holdout: independent odd shapes and unseen batch/head combinations.
++        - [holdout, 24, 24, 64, 3, 8193, 12289]
++        - [holdout, 16, 16, 64, 3, 11009, 10241]
++        - [holdout, 16, 16, 64, 5, 6657, 9217]
++        - [holdout, 24, 24, 64, 2, 11009, 15361]
++        - [holdout, 40, 40, 64, 1, 13313, 10241]
++        - [holdout, 20, 20, 64, 4, 6657, 18433]
++        - [holdout, 12, 12, 64, 6, 7283, 11265]
++        - [holdout, 8, 8, 64, 7, 9363, 24577]
++        - [holdout, 40, 40, 64, 2, 6657, 13313]
++        - [holdout, 24, 24, 64, 1, 22017, 9217]
++        - [holdout, 32, 32, 64, 3, 5505, 20481]
++        - [holdout, 24, 24, 64, 5, 4401, 16385]
++
++  - name: d64_direct_scope_controls
++    baseline: {use_tma_o: true}
++    candidate: {use_tma_o: false}
++    correctness:
++      mode: dense
++      q_heads: 8
++      kv_heads: 2
++      head_dim: 64
++      batch: 1
++      seqlen_q: 65
++      seqlen_k: 129
++      causal: true
++    case_table:
++      mode: dense
++      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k, causal]
++      rows:
++        # Short-context and launch-wave controls around 152-SM occupancy boundaries.
++        - [boundary, 16, 16, 64, 1, 1151, 4096, false]
++        - [boundary, 16, 16, 64, 1, 1152, 4096, false]
++        - [boundary, 16, 16, 64, 1, 1153, 4096, false]
++        - [boundary, 32, 32, 64, 1, 511, 8192, false]
++        - [boundary, 32, 32, 64, 1, 512, 8192, false]
++        - [boundary, 32, 32, 64, 1, 513, 8192, false]
++        - [boundary, 16, 16, 64, 2, 639, 4096, false]
++        - [boundary, 8, 8, 64, 4, 257, 2049, false]
++        # Long causal MHA controls.
++        - [discovery, 16, 16, 64, 1, 32768, 8192, true]
++        - [discovery, 32, 32, 64, 1, 16384, 16384, true]
++        - [discovery, 16, 16, 64, 2, 16385, 12289, true]
++        - [discovery, 32, 32, 64, 2, 8193, 24577, true]
++        - [discovery, 16, 16, 64, 4, 8192, 32768, true]
++        - [discovery, 24, 24, 64, 3, 8193, 12289, true]
++        - [discovery, 40, 40, 64, 1, 13313, 10241, true]
++        - [discovery, 16, 16, 64, 5, 6657, 9217, true]
++        # Long legal GQA/MQA controls; every ratio divides tile_m=128.
++        - [discovery, 16, 4, 64, 2, 16384, 8192, false]
++        - [discovery, 32, 8, 64, 2, 8192, 16384, false]
++        - [discovery, 32, 4, 64, 1, 16385, 24577, false]
++        - [discovery, 16, 1, 64, 2, 16385, 12289, false]
++        - [discovery, 24, 6, 64, 3, 8193, 10241, false]
++        - [discovery, 40, 10, 64, 1, 13313, 18433, false]
++        - [discovery, 24, 3, 64, 3, 8193, 16385, false]
++        - [discovery, 32, 2, 64, 2, 8193, 32769, false]
++        # Independent controls holdout: unseen short, causal, and GQA cells.
++        - [holdout, 24, 24, 64, 1, 769, 3073, false]
++        - [holdout, 12, 12, 64, 2, 769, 6145, false]
++        - [holdout, 8, 8, 64, 3, 641, 4097, false]
++        - [holdout, 40, 40, 64, 1, 385, 7169, false]
++        - [holdout, 20, 20, 64, 3, 9001, 14337, true]
++        - [holdout, 24, 24, 64, 2, 11009, 13313, true]
++        - [holdout, 48, 48, 64, 1, 11009, 9217, true]
++        - [holdout, 12, 12, 64, 5, 8801, 18433, true]
++        - [holdout, 24, 6, 64, 2, 11009, 11265, false]
++        - [holdout, 32, 4, 64, 3, 5505, 15361, false]
++        - [holdout, 48, 12, 64, 1, 11009, 20481, false]
++        - [holdout, 16, 2, 64, 5, 6657, 10241, false]
++
++  - name: d128_1cta_long_noncausal_mha
++    baseline: {use_2cta_instrs: true}
++    candidate: {use_2cta_instrs: false}
++    correctness:
++      mode: dense
++      q_heads: 8
++      kv_heads: 8
++      head_dim: 128
++      batch: 1
++      seqlen_q: 257
++      seqlen_k: 263
++      causal: false
++    case_table:
++      mode: dense
++      causal: false
++      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k]
++      rows:
++        # Discovery: same frozen geometry as D64, measured independently.
++        - [discovery, 16, 16, 128, 1, 32768, 16384]
++        - [discovery, 16, 16, 128, 1, 32768, 32768]
++        - [discovery, 32, 32, 128, 1, 16384, 8192]
++        - [discovery, 32, 32, 128, 1, 16384, 24576]
++        - [discovery, 16, 16, 128, 2, 16384, 12288]
++        - [discovery, 16, 16, 128, 2, 16384, 32768]
++        - [discovery, 32, 32, 128, 2, 8192, 8192]
++        - [discovery, 32, 32, 128, 2, 8192, 24576]
++        - [discovery, 16, 16, 128, 4, 8192, 16384]
++        - [discovery, 16, 16, 128, 4, 8192, 32768]
++        - [discovery, 32, 32, 128, 4, 4096, 8192]
++        - [discovery, 32, 32, 128, 4, 4096, 24576]
++        # Boundary: total-Q*heads and K-block thresholds, including odd lengths.
++        - [boundary, 16, 16, 128, 1, 32767, 9216]
++        - [boundary, 16, 16, 128, 1, 32768, 9216]
++        - [boundary, 16, 16, 128, 1, 32769, 9216]
++        - [boundary, 32, 32, 128, 1, 16383, 12288]
++        - [boundary, 32, 32, 128, 1, 16384, 12288]
++        - [boundary, 32, 32, 128, 1, 16385, 12288]
++        - [boundary, 32, 32, 128, 2, 8191, 16384]
++        - [boundary, 32, 32, 128, 2, 8192, 16384]
++        - [boundary, 32, 32, 128, 2, 8193, 16384]
++        - [boundary, 16, 16, 128, 2, 24577, 8191]
++        - [boundary, 16, 16, 128, 2, 24577, 8192]
++        - [boundary, 16, 16, 128, 2, 24577, 8193]
++        # Holdout: independent odd shapes and unseen batch/head combinations.
++        - [holdout, 24, 24, 128, 3, 8193, 12289]
++        - [holdout, 16, 16, 128, 3, 11009, 10241]
++        - [holdout, 16, 16, 128, 5, 6657, 9217]
++        - [holdout, 24, 24, 128, 2, 11009, 15361]
++        - [holdout, 40, 40, 128, 1, 13313, 10241]
++        - [holdout, 20, 20, 128, 4, 6657, 18433]
++        - [holdout, 12, 12, 128, 6, 7283, 11265]
++        - [holdout, 8, 8, 128, 7, 9363, 24577]
++        - [holdout, 40, 40, 128, 2, 6657, 13313]
++        - [holdout, 24, 24, 128, 1, 22017, 9217]
++        - [holdout, 32, 32, 128, 3, 5505, 20481]
++        - [holdout, 24, 24, 128, 5, 4401, 16385]
++
++  - name: d128_1cta_scope_controls
++    baseline: {use_2cta_instrs: true}
++    candidate: {use_2cta_instrs: false}
++    correctness:
++      mode: dense
++      q_heads: 8
++      kv_heads: 2
++      head_dim: 128
++      batch: 1
++      seqlen_q: 257
++      seqlen_k: 263
++      causal: false
++    case_table:
++      mode: dense
++      causal: false
++      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k]
++      rows:
++        # Short-context and 152-SM launch-wave controls; all remain 2CTA-eligible.
++        - [boundary, 16, 16, 128, 1, 1151, 4096]
++        - [boundary, 16, 16, 128, 1, 1152, 4096]
++        - [boundary, 16, 16, 128, 1, 1153, 4096]
++        - [boundary, 32, 32, 128, 1, 511, 8192]
++        - [boundary, 32, 32, 128, 1, 512, 8192]
++        - [boundary, 32, 32, 128, 1, 513, 8192]
++        - [boundary, 16, 16, 128, 2, 511, 2048]
++        - [boundary, 16, 16, 128, 2, 512, 2048]
++        - [boundary, 16, 16, 128, 2, 513, 2048]
++        - [boundary, 8, 8, 128, 4, 511, 4096]
++        - [boundary, 8, 8, 128, 4, 512, 4096]
++        - [boundary, 8, 8, 128, 4, 513, 4096]
++        # Long legal GQA/MQA controls; every ratio divides tile_m=128.
++        - [discovery, 16, 4, 128, 2, 16384, 8192]
++        - [discovery, 32, 8, 128, 2, 8192, 16384]
++        - [discovery, 32, 4, 128, 1, 16385, 24577]
++        - [discovery, 16, 1, 128, 2, 16385, 12289]
++        - [discovery, 24, 6, 128, 3, 8193, 10241]
++        - [discovery, 40, 10, 128, 1, 13313, 18433]
++        - [discovery, 24, 3, 128, 3, 8193, 16385]
++        - [discovery, 32, 2, 128, 2, 8193, 32769]
++        - [discovery, 8, 2, 128, 8, 8193, 9217]
++        - [discovery, 64, 8, 128, 1, 8193, 12289]
++        - [discovery, 48, 12, 128, 2, 5505, 20481]
++        - [discovery, 32, 4, 128, 4, 4097, 16385]
++        # Independent controls holdout: unseen short-MHA and long-GQA cells.
++        - [holdout, 24, 24, 128, 1, 769, 3073]
++        - [holdout, 12, 12, 128, 2, 769, 6145]
++        - [holdout, 8, 8, 128, 3, 641, 4097]
++        - [holdout, 40, 40, 128, 1, 385, 7169]
++        - [holdout, 20, 20, 128, 2, 385, 5121]
++        - [holdout, 8, 8, 128, 4, 385, 8193]
++        - [holdout, 24, 6, 128, 2, 11009, 11265]
++        - [holdout, 32, 4, 128, 3, 5505, 15361]
++        - [holdout, 48, 12, 128, 1, 11009, 20481]
++        - [holdout, 16, 2, 128, 5, 6657, 10241]
++        - [holdout, 64, 16, 128, 1, 8257, 13313]
++        - [holdout, 32, 8, 128, 4, 4225, 18433]
+diff --git a/flash_attn/cute/config.py b/flash_attn/cute/config.py
+index cf388c3..4048ee6 100644
+--- a/flash_attn/cute/config.py
++++ b/flash_attn/cute/config.py
+@@ -425,6 +425,30 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
+     overlap_s_o_s_q = is_sm100_family and has_s_o_s_q_overlap(inputs, num_splits)
+     is_varlen_mha = inputs.is_varlen and inputs.qhead_per_kvhead == 1
+     is_dense_noncausal = not inputs.is_varlen and not inputs.causal and not inputs.local
++    is_b200_bf16_output = (
++        inputs.device_arch == 100
++        and inputs.dtype == "torch.bfloat16"
++        and is_dense_noncausal
++        and inputs.head_dim == inputs.head_dim_v
++        and inputs.head_dim in (64, 128)
++        and inputs.qhead_per_kvhead in (1, 4, 8, 16)
++        and (inputs.qhead_per_kvhead == 1 or inputs.pack_gqa)
++        and packed_seqlen_q > 2 * tile_m
++        and inputs.max_seqlen_k >= 2048
++        and not is_split_kv
++        and inputs.page_size is None
++        and not inputs.use_block_sparsity
++        and not inputs.has_qv
++        and not inputs.has_gather_kv
++        and not inputs.has_score_mod
++        and not inputs.has_mask_mod
++        and not inputs.has_learnable_sink
++        and not inputs.has_lse
++        and tile_m == 128
++        and tile_n == 128
++    )
++    if is_b200_bf16_output and inputs.head_dim == 128:
++        use_2cta_instrs = False
+     is_standard_sm103_bf16 = (
+         inputs.device_arch == 103
+         and inputs.dtype == "torch.bfloat16"
+@@ -520,6 +544,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
+     use_tma_o = (
+         is_sm100_family
+         and not is_dedicated_hd256
++        and not (is_b200_bf16_output and inputs.head_dim == 64)
+         and can_use_tma_o(inputs, tile_m=tile_m, num_splits=num_splits)
+     )
+ 
+diff --git a/flash_attn/cute/pyproject.toml b/flash_attn/cute/pyproject.toml
+index 174f7db..ea3bd35 100644
+--- a/flash_attn/cute/pyproject.toml
++++ b/flash_attn/cute/pyproject.toml
+@@ -36,6 +36,7 @@ cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.0.dev0"]
+ dev = [
+     "pytest",
+     "pytest-xdist",
++    "pyyaml",
+     "ruff",
+ ]
+ 
+diff --git a/tests/cute/test_flash_attn.py b/tests/cute/test_flash_attn.py
+index 26f09c0..d0ac3d6 100644
+--- a/tests/cute/test_flash_attn.py
++++ b/tests/cute/test_flash_attn.py
+@@ -333,6 +333,46 @@ def test_flash_attn_dense_short_k_clc_default_matches_reference():
+     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+ 
+ 
++@pytest.mark.parametrize("head_dim", [64, 128])
++@pytest.mark.skipif(
++    torch.cuda.get_device_capability() != (10, 0) or USE_FAKE_TENSOR,
++    reason="B200/SM100 BF16 output-policy runtime test",
++)
++def test_flash_attn_b200_bf16_output_policy_default_matches_reference(head_dim):
++    """Exercise the B200 output-only policy through config=None."""
++    torch.manual_seed(0)
++    q = torch.randn(1, 257, 16, head_dim, device="cuda", dtype=torch.bfloat16)
++    k = torch.randn(1, 2048, 4, head_dim, device="cuda", dtype=torch.bfloat16)
++    v = torch.randn_like(k)
++    selected = {}
++
++    def capture_config(inputs):
++        selected["inputs"] = inputs
++        selected["config"] = select_fwd_config(inputs)
++        return selected["config"]
++
++    with mock.patch(
++        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
++    ):
++        out = _flash_attn_fwd(q, k, v)[0]
++
++    assert selected["inputs"].device_arch == 100
++    assert selected["inputs"].pack_gqa
++    assert not selected["inputs"].has_lse
++    if head_dim == 64:
++        assert not selected["config"].use_tma_o
++    else:
++        assert not selected["config"].use_2cta_instrs
++    reference = torch.nn.functional.scaled_dot_product_attention(
++        q.float().transpose(1, 2),
++        k.float().transpose(1, 2),
++        v.float().transpose(1, 2),
++        scale=1 / math.sqrt(head_dim),
++        enable_gqa=True,
++    ).transpose(1, 2)
++    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
++
++
+ @pytest.mark.skipif(
+     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+     reason="SM100/SM110 selector metadata test",
+diff --git a/tests/cute/test_fwd_config.py b/tests/cute/test_fwd_config.py
+index 9e2b992..65fb1d5 100644
+--- a/tests/cute/test_fwd_config.py
++++ b/tests/cute/test_fwd_config.py
+@@ -242,6 +242,7 @@ def test_sm103_dense_short_k_clc_scope(changes, expected_clc):
+ 
+ def test_selector_preserves_a_codegen_changing_2cta_boundary():
+     one_cta = make_inputs(
++        dtype="torch.float16",
+         head_dim=128,
+         head_dim_v=128,
+         max_seqlen_q=129,
+@@ -292,8 +293,136 @@ def test_varlen_k_dense_q_clc_rejects_persistent_codegen_flag():
+         validate_fwd_config(replace(config, is_persistent=True), inputs)
+ 
+ 
+-def test_long_dense_d128_selects_2cta():
+-    inputs = make_inputs(head_dim=128, head_dim_v=128)
++@pytest.mark.parametrize(
++    ("head_dim", "config_field"),
++    [(64, "use_tma_o"), (128, "use_2cta_instrs")],
++)
++@pytest.mark.parametrize("qhead_per_kvhead", [1, 4, 8, 16])
++def test_b200_bf16_output_policy_covers_measured_mha_and_gqa(
++    head_dim, config_field, qhead_per_kvhead
++):
++    inputs = make_inputs(
++        head_dim=head_dim,
++        head_dim_v=head_dim,
++        num_heads=16,
++        num_heads_kv=16 // qhead_per_kvhead,
++        pack_gqa=qhead_per_kvhead != 1,
++        batch_size=1,
++        total_q=257,
++        total_k=2048,
++        max_seqlen_q=257,
++        max_seqlen_k=2048,
++    )
++
++    assert not getattr(select_fwd_config(inputs), config_field)
++
++
++@pytest.mark.parametrize(
++    ("changes", "expected_tma_o"),
++    [
++        ({}, False),
++        ({"max_seqlen_q": 256}, True),
++        ({"max_seqlen_k": 2047}, True),
++    ],
++)
++def test_b200_d64_output_policy_boundaries(changes, expected_tma_o):
++    inputs = replace(
++        make_inputs(
++            batch_size=1,
++            total_q=257,
++            total_k=2048,
++            max_seqlen_q=257,
++            max_seqlen_k=2048,
++        ),
++        **changes,
++    )
++
++    assert select_fwd_config(inputs).use_tma_o is expected_tma_o
++
++
++def test_b200_d128_output_policy_keeps_short_k_on_2cta():
++    inputs = make_inputs(
++        head_dim=128,
++        head_dim_v=128,
++        batch_size=1,
++        total_q=257,
++        total_k=2048,
++        max_seqlen_q=257,
++        max_seqlen_k=2048,
++    )
++
++    assert not select_fwd_config(inputs).use_2cta_instrs
++    assert select_fwd_config(replace(inputs, max_seqlen_k=2047)).use_2cta_instrs
++
++
++@pytest.mark.parametrize(
++    "changes",
++    [
++        {"dtype": "torch.float16"},
++        {"device_arch": 103},
++        {"causal": True},
++        {"local": True},
++        {"requested_num_splits": 2},
++        {"page_size": 128},
++        {"use_block_sparsity": True},
++        {"has_qv": True},
++        {"has_gather_kv": True},
++        {"has_score_mod": True},
++        {"has_mask_mod": True},
++        {"has_learnable_sink": True},
++        {"has_lse": True},
++        {"requested_tile_m": 64},
++        {"requested_tile_n": 64},
++        {"num_heads": 16, "num_heads_kv": 8, "pack_gqa": True},
++        {"num_heads": 16, "num_heads_kv": 4, "pack_gqa": False},
++    ],
++)
++def test_b200_d64_output_policy_exclusions(changes):
++    inputs = replace(
++        make_inputs(
++            batch_size=1,
++            total_q=257,
++            total_k=2048,
++            max_seqlen_q=257,
++            max_seqlen_k=2048,
++        ),
++        **changes,
++    )
++
++    assert select_fwd_config(inputs).use_tma_o
++
++
++@pytest.mark.parametrize(
++    "changes",
++    [
++        {"dtype": "torch.float16"},
++        {"device_arch": 103},
++        {"page_size": 128},
++        {"has_qv": True},
++        {"has_gather_kv": True},
++        {"has_score_mod": True},
++        {"has_mask_mod": True},
++        {"has_learnable_sink": True},
++        {"has_lse": True},
++        {"requested_tile_m": 64},
++        {"requested_tile_n": 64},
++        {"num_heads": 16, "num_heads_kv": 8, "pack_gqa": True},
++        {"num_heads": 16, "num_heads_kv": 4, "pack_gqa": False},
++    ],
++)
++def test_b200_d128_output_policy_exclusions(changes):
++    inputs = replace(
++        make_inputs(
++            head_dim=128,
++            head_dim_v=128,
++            batch_size=1,
++            total_q=257,
++            total_k=2048,
++            max_seqlen_q=257,
++            max_seqlen_k=2048,
++        ),
++        **changes,
++    )
+ 
+     assert select_fwd_config(inputs).use_2cta_instrs
+ 
