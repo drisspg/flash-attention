@@ -4,9 +4,14 @@
 from __future__ import annotations
 
 import json
+import math
+import statistics
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import seaborn as sns
 from matplotlib.lines import Line2D
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
@@ -100,7 +105,16 @@ def setup_diagram(title: str, subtitle: str):
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-    ax.text(0.02, 0.95, title, ha="left", va="top", fontsize=25, color=TEXT, fontweight="bold")
+    ax.text(
+        0.02,
+        0.95,
+        title,
+        ha="left",
+        va="top",
+        fontsize=25,
+        color=TEXT,
+        fontweight="bold",
+    )
     ax.text(0.02, 0.895, subtitle, ha="left", va="top", fontsize=13, color=GRAY)
     return fig, ax
 
@@ -348,176 +362,334 @@ def benchmark_diagram() -> None:
     save(fig, "benchmark-contract.png")
 
 
-def policy_plot(
+def summarize_measured_rows(rows: list[dict]) -> dict:
+    """Recompute the benchmark summary directly from measured result rows."""
+    paired_round_logs = [
+        [
+            math.log(baseline / candidate)
+            for baseline, candidate in zip(
+                row["baseline_round_medians_us"],
+                row["candidate_round_medians_us"],
+            )
+        ]
+        for row in rows
+    ]
+    mean_log = statistics.mean(map(statistics.mean, paired_round_logs))
+    variance = (
+        sum(
+            statistics.variance(logs) / len(logs) if len(logs) > 1 else 0.0
+            for logs in paired_round_logs
+        )
+        / len(rows) ** 2
+    )
+    stderr = math.sqrt(variance)
+    speedups = [row["speedup"] for row in rows]
+    return {
+        "cells": len(rows),
+        "geomean": math.exp(mean_log),
+        "ci95": [
+            math.exp(mean_log - 1.96 * stderr),
+            math.exp(mean_log + 1.96 * stderr),
+        ],
+        "weighted": sum(row["baseline_median_us"] for row in rows)
+        / sum(row["candidate_median_us"] for row in rows),
+        "minimum": min(speedups),
+        "maximum": max(speedups),
+    }
+
+
+def measured_cell_plot(
     *,
     title: str,
     subtitle: str,
-    rows: list[dict],
+    groups: list[dict],
     source: str,
     timing: str,
+    confirmation: str,
     name: str,
     xlim: tuple[float, float],
-    confirmation: str,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(16, 8.8))
-    fig.subplots_adjust(left=0.31, right=0.96, top=0.78, bottom=0.24)
-    colors = [BLUE, PURPLE, GREEN, ORANGE, CYAN, RED]
-    positions = list(range(len(rows) - 1, -1, -1))
-
-    ax.axvline(1.0, color=TEXT, linewidth=1.5, linestyle="--", alpha=0.7, zorder=0)
-    ax.text(1.002, len(rows) - 0.45, "old policy", color=TEXT, fontsize=11, va="top")
-
-    for y, row, color in zip(positions, rows, colors):
-        minimum = row["minimum"]
-        maximum = row["maximum"]
-        ci_low, ci_high = row["ci95"]
-        geomean = row["geomean"]
-        weighted = row["weighted"]
-        is_control = row.get("control", False)
-        if is_control:
-            color = RED
-        ax.hlines(y, minimum, maximum, color=color, alpha=0.32, linewidth=4, zorder=1)
-        ax.plot([minimum, maximum], [y, y], "|", color=color, markersize=13, markeredgewidth=2)
-        ax.hlines(y, ci_low, ci_high, color=color, linewidth=12, alpha=0.92, zorder=3)
-        ax.scatter(geomean, y, s=150, color=color, edgecolor="white", linewidth=1.5, zorder=4)
-        ax.scatter(weighted, y, s=105, color=color, marker="D", edgecolor="white", linewidth=1.2, zorder=4)
-        label_x = min(maximum + (xlim[1] - xlim[0]) * 0.012, xlim[1] - 0.005)
-        align = "left" if label_x < xlim[1] - 0.02 else "right"
-        ax.text(
-            label_x,
-            y + 0.11,
-            f"max {maximum:.3f}×",
-            color=color,
-            fontsize=10.5,
-            va="bottom",
-            ha=align,
-            fontweight="bold",
-        )
-        ax.text(
-            geomean,
-            y - 0.19,
-            f"geo {geomean:.3f}×  •  weighted {weighted:.3f}×  •  n={row['cells']}",
-            color=TEXT,
-            fontsize=11.5,
-            va="top",
-            ha="center",
-            fontweight="bold",
-        )
-
-    ax.set_yticks(positions)
-    ax.set_yticklabels([row["label"] for row in rows], fontsize=13, fontweight="bold")
-    ax.set_xlim(*xlim)
-    ax.set_ylim(-0.65, len(rows) - 0.25)
-    ax.set_xlabel("speedup (old config latency / new config latency)", labelpad=12)
-    ax.grid(axis="x", color=BORDER, linewidth=0.8, alpha=0.6)
-    for spine in ["top", "right", "left"]:
-        ax.spines[spine].set_visible(False)
-    ax.spines["bottom"].set_color(BORDER)
-    ax.tick_params(axis="y", length=0, pad=12)
-    ax.tick_params(axis="x", colors=GRAY)
-
-    fig.text(0.035, 0.94, title, fontsize=25, fontweight="bold", color=TEXT, ha="left", va="top")
-    fig.text(0.035, 0.885, subtitle, fontsize=13.5, color=GRAY, ha="left", va="top")
-
-    legend = [
-        Line2D([0], [0], marker="o", color="w", markerfacecolor=BLUE, markersize=11, label="geomean"),
-        Line2D([0], [0], marker="D", color="w", markerfacecolor=BLUE, markersize=9, label="time-weighted"),
-        Line2D([0], [0], color=BLUE, linewidth=9, label="paired-round 95% CI"),
-        Line2D([0], [0], color=BLUE, alpha=0.35, linewidth=4, marker="|", markersize=10, label="cell median min–max"),
+    """Plot every measured cell with Seaborn and overlay timing aggregates."""
+    records = []
+    for group in groups:
+        for row in group["rows"]:
+            records.append(
+                {
+                    "policy": group["label"],
+                    "phase": row["phase"],
+                    "speedup": row["speedup"],
+                }
+            )
+    frame = pd.DataFrame.from_records(records)
+    order = [group["label"] for group in groups]
+    phase_order = [
+        phase
+        for phase in ("discovery", "boundary", "holdout")
+        if phase in set(frame["phase"])
     ]
-    fig.legend(
-        handles=legend,
-        loc="upper left",
-        bbox_to_anchor=(0.035, 0.825),
-        ncol=4,
-        frameon=False,
-        fontsize=11.5,
-        handlelength=2.4,
-        columnspacing=1.6,
+    phase_palette = {
+        "discovery": "#2563eb",
+        "boundary": "#ea580c",
+        "holdout": "#16a34a",
+    }
+
+    sns.set_theme(style="whitegrid", context="notebook")
+    np.random.seed(0)
+    height = 8.9 if len(groups) >= 4 else 8.2
+    fig, ax = plt.subplots(figsize=(16.5, height))
+    fig.subplots_adjust(left=0.29, right=0.72, top=0.76, bottom=0.23)
+
+    ax.axvspan(xlim[0], 1.0, color="#fee2e2", alpha=0.34, zorder=0)
+    ax.axvspan(1.0, xlim[1], color="#dcfce7", alpha=0.19, zorder=0)
+    sns.stripplot(
+        data=frame,
+        x="speedup",
+        y="policy",
+        order=order,
+        hue="phase",
+        hue_order=phase_order,
+        palette=phase_palette,
+        dodge=True,
+        jitter=0.18,
+        size=6.2,
+        alpha=0.72,
+        edgecolor="white",
+        linewidth=0.45,
+        ax=ax,
+        zorder=2,
     )
 
-    fig.text(0.035, 0.145, timing, fontsize=11.5, color=TEXT, ha="left", va="top", fontweight="bold")
-    fig.text(0.035, 0.098, confirmation, fontsize=11.5, color=GREEN, ha="left", va="top", fontweight="bold")
-    fig.text(0.035, 0.052, f"Source: {source}", fontsize=10.8, color=GRAY, ha="left", va="top")
+    summaries = []
+    for y, group in enumerate(groups):
+        summary = summarize_measured_rows(group["rows"])
+        summaries.append(summary)
+        low, high = summary["ci95"]
+        color = RED if group.get("control") else TEXT
+        ax.errorbar(
+            summary["geomean"],
+            y,
+            xerr=np.array(
+                [
+                    [summary["geomean"] - low],
+                    [high - summary["geomean"]],
+                ]
+            ),
+            fmt="D",
+            color=color,
+            markerfacecolor="white",
+            markeredgewidth=2.0,
+            markersize=8.5,
+            elinewidth=4.0,
+            capsize=7,
+            capthick=2.0,
+            zorder=5,
+        )
+        ax.scatter(
+            summary["weighted"],
+            y,
+            marker="X",
+            s=125,
+            color=PURPLE if not group.get("control") else RED,
+            edgecolor="white",
+            linewidth=1.2,
+            zorder=6,
+        )
+        ax.text(
+            1.035,
+            y,
+            (
+                f"geo {summary['geomean']:.3f}× "
+                f"[{low:.3f}, {high:.3f}]\n"
+                f"weighted {summary['weighted']:.3f}×\n"
+                f"min–max {summary['minimum']:.3f}–{summary['maximum']:.3f}×  ·  "
+                f"n={summary['cells']}"
+            ),
+            transform=ax.get_yaxis_transform(),
+            ha="left",
+            va="center",
+            fontsize=11.2,
+            linespacing=1.35,
+            color=color,
+            fontweight="bold",
+            clip_on=False,
+        )
+
+    ax.axvline(1.0, color=TEXT, linewidth=1.6, linestyle="--", alpha=0.8, zorder=1)
+    ax.text(
+        1.002,
+        1.012,
+        "old policy",
+        transform=ax.get_xaxis_transform(),
+        color=TEXT,
+        fontsize=10.8,
+        va="bottom",
+        ha="left",
+    )
+    ax.set_xlim(*xlim)
+    ax.set_xlabel(
+        "measured per-cell speedup  (baseline median / candidate median)", labelpad=13
+    )
+    ax.set_ylabel("")
+    ax.tick_params(axis="y", length=0, pad=12, labelsize=12.5)
+    ax.tick_params(axis="x", colors=GRAY)
+    for tick in ax.get_yticklabels():
+        tick.set_fontweight("bold")
+    for tick, group in zip(ax.get_yticklabels(), groups):
+        if group.get("control"):
+            tick.set_color(RED)
+    ax.grid(axis="x", color=BORDER, linewidth=0.8, alpha=0.65)
+    ax.grid(axis="y", visible=False)
+    sns.despine(ax=ax, top=True, right=True, left=True)
+
+    phase_handles, phase_labels = ax.get_legend_handles_labels()
+    if ax.legend_ is not None:
+        ax.legend_.remove()
+    aggregate_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="D",
+            color=TEXT,
+            markerfacecolor="white",
+            markeredgewidth=1.8,
+            markersize=8,
+            linewidth=3,
+            label="geomean ± paired-round 95% CI",
+        ),
+        Line2D(
+            [0],
+            [0],
+            marker="X",
+            color="white",
+            markerfacecolor=PURPLE,
+            markeredgecolor="white",
+            markersize=10,
+            label="time-weighted",
+        ),
+    ]
+    fig.legend(
+        handles=[*phase_handles[: len(phase_order)], *aggregate_handles],
+        labels=[
+            *phase_labels[: len(phase_order)],
+            *(item.get_label() for item in aggregate_handles),
+        ],
+        loc="upper left",
+        bbox_to_anchor=(0.035, 0.825),
+        ncol=len(phase_order) + 2,
+        frameon=False,
+        fontsize=11.2,
+        handlelength=2.2,
+        columnspacing=1.4,
+    )
+
+    fig.text(
+        0.035,
+        0.95,
+        title,
+        fontsize=24,
+        fontweight="bold",
+        color=TEXT,
+        ha="left",
+        va="top",
+    )
+    fig.text(0.035, 0.895, subtitle, fontsize=13.3, color=GRAY, ha="left", va="top")
+    fig.text(
+        0.035,
+        0.145,
+        "Every circle is one timed workload cell from the archived results.json; no synthetic points or smoothing.",
+        fontsize=11.6,
+        color=TEXT,
+        ha="left",
+        va="top",
+        fontweight="bold",
+    )
+    fig.text(0.035, 0.102, timing, fontsize=10.9, color=TEXT, ha="left", va="top")
+    fig.text(
+        0.035,
+        0.062,
+        confirmation,
+        fontsize=10.9,
+        color=GREEN,
+        ha="left",
+        va="top",
+        fontweight="bold",
+    )
+    fig.text(
+        0.035,
+        0.025,
+        f"Raw source: {source}",
+        fontsize=10.1,
+        color=GRAY,
+        ha="left",
+        va="top",
+    )
     save(fig, name)
 
 
 def gb300_plot() -> None:
-    data = json.loads((ROOT / "gb300_summary.json").read_text())
+    exact = json.loads((ROOT / "evidence/gb300/final_exact_results.json").read_text())[
+        "results"
+    ]
+    dense = json.loads(
+        (ROOT / "evidence/gb300/final_dense_narrow_results.json").read_text()
+    )["results"]
     labels = {
         "long_k_d64_nonpersistent": "Dense noncausal D64\npersistent → single",
         "balanced_varlen_mha_clc": "Balanced packed-varlen MHA\nnon-CLC → CLC",
         "high_head_varlen_clc": "Packed-varlen H≥24\nnon-CLC → CLC",
         "dense_short_k_clc": "Dense causal B≥32, short-K\nnon-CLC → CLC",
     }
-    rows = []
-    for policy in data["policies"]:
-        rows.append(
-            {
-                "label": labels[policy["experiment"]],
-                "cells": policy["cells"],
-                "geomean": policy["geomean_speedup"],
-                "weighted": policy["time_weighted_speedup"],
-                "minimum": policy["minimum_speedup"],
-                "maximum": policy["maximum_speedup"],
-                "ci95": policy["geomean_ci95"],
-            }
-        )
-    policy_plot(
-        title="GB300 / SM103: four narrow selector wins",
-        subtitle="BF16 output-only policies promoted from 297 frozen boundary + model-family holdout cells.",
-        rows=rows,
-        source="benchmarks/configs/fwd_config_sm103.yaml → benchmarks/fwd_config_bench.py",
+    order = [
+        "long_k_d64_nonpersistent",
+        "balanced_varlen_mha_clc",
+        "high_head_varlen_clc",
+        "dense_short_k_clc",
+    ]
+    groups = []
+    for experiment in order:
+        source_rows = dense if experiment == "dense_short_k_clc" else exact
+        rows = [row for row in source_rows if row["experiment"] == experiment]
+        groups.append({"label": labels[experiment], "rows": rows})
+    assert [len(group["rows"]) for group in groups] == [96, 84, 50, 67]
+    measured_cell_plot(
+        title="GB300 / SM103: measured cells behind four selector changes",
+        subtitle="BF16 output-only boundary and model-family holdout results; color is campaign phase, not a fitted distribution.",
+        groups=groups,
+        source="evidence/gb300/final_{exact,dense_narrow}_results.json",
         timing="7 alternating rounds × 31 fixed-pointer CUDA-graph replays per arm; preallocated outputs/workspaces; 20 untimed BF16 GEMMs before each arm.",
         confirmation="No retained holdout regression and no paired interval wholly below 1.0; config=None selector checks and independent correctness passed.",
         name="gb300-policy-gains.png",
-        xlim=(0.985, 1.455),
+        xlim=(0.985, 1.445),
     )
 
 
 def b200_plot() -> None:
-    data = json.loads((ROOT / "b200_summary.json").read_text())
-    summaries = data["phase_summaries"]
-    control = data["excluded_controls"]["timed_excluded_strata"]["d64_causal"]["summary"]
-    rows = [
+    rows = json.loads((ROOT / "evidence/b200/results.json").read_text())["results"]
+    groups = [
         {
             "label": "Dense noncausal D64\nTMA O → direct O",
-            "cells": summaries["d64_direct_output"]["all"]["cells"],
-            "geomean": summaries["d64_direct_output"]["all"]["geomean_speedup"],
-            "weighted": summaries["d64_direct_output"]["all"]["time_weighted_speedup"],
-            "minimum": summaries["d64_direct_output"]["all"]["minimum_speedup"],
-            "maximum": summaries["d64_direct_output"]["all"]["maximum_speedup"],
-            "ci95": summaries["d64_direct_output"]["all"]["geomean_ci95"],
+            "rows": [row for row in rows if row["d"] == 64 and not row["causal"]],
         },
         {
             "label": "Dense noncausal D128\n2CTA → 1CTA",
-            "cells": summaries["d128_1cta"]["all"]["cells"],
-            "geomean": summaries["d128_1cta"]["all"]["geomean_speedup"],
-            "weighted": summaries["d128_1cta"]["all"]["time_weighted_speedup"],
-            "minimum": summaries["d128_1cta"]["all"]["minimum_speedup"],
-            "maximum": summaries["d128_1cta"]["all"]["maximum_speedup"],
-            "ci95": summaries["d128_1cta"]["all"]["geomean_ci95"],
+            "rows": [row for row in rows if row["d"] == 128],
         },
         {
             "label": "D64 causal control\nrejected",
-            "cells": control["cells"],
-            "geomean": control["geomean_speedup"],
-            "weighted": control["time_weighted_speedup"],
-            "minimum": control["minimum_speedup"],
-            "maximum": control["maximum_speedup"],
-            "ci95": control["geomean_ci95"],
+            "rows": [row for row in rows if row["d"] == 64 and row["causal"]],
             "control": True,
         },
     ]
-    policy_plot(
-        title="B200 / SM100: direct output for D64, 1CTA for D128",
-        subtitle="BF16 output-only policies promoted from 132 retained discovery + boundary + independent holdout cells; causal was measured and rejected.",
-        rows=rows,
-        source="benchmarks/configs/fwd_config_b200.yaml → benchmarks/fwd_config_bench.py",
+    assert [len(group["rows"]) for group in groups] == [60, 72, 12]
+    measured_cell_plot(
+        title="B200 / SM100: measured cells behind direct O and 1CTA",
+        subtitle="BF16 output-only discovery, boundary, and independent holdout results; the causal control was timed and rejected.",
+        groups=groups,
+        source="evidence/b200/results.json (SHA256 86e7b207…1334)",
         timing="7 alternating rounds × 31 fixed-pointer CUDA-graph replays per arm; preallocated outputs/workspaces; 20 untimed BF16 GEMMs before each arm.",
         confirmation="Fresh old-baseline vs config=None confirmation: D64 1.208× and D128 1.211× geomean across 12 cells each; 24/24 selector + correctness checks passed.",
         name="b200-policy-gains.png",
-        xlim=(0.975, 1.595),
+        xlim=(0.975, 1.575),
     )
 
 
